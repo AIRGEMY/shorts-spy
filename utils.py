@@ -125,3 +125,26 @@ def hof_file():
 
 def load_profiles(): return json.load(open(PROFILES_FILE)) if os.path.exists(PROFILES_FILE) else {}
 def save_profiles(p): json.dump(p, open(PROFILES_FILE, "w"), indent=2)
+
+# ══════════════════════════════════════════════════════════════
+#  VELOCITY
+# ══════════════════════════════════════════════════════════════
+
+def velocity_label(history):
+    if not history or len(history) < 3: return "[dim]—[/dim]"
+    recent  = history[-1]["views"] - history[-2]["views"]
+    earlier = history[-2]["views"] - history[-3]["views"]
+    if earlier == 0: return "[dim]flat[/dim]"
+    change = (recent - earlier) / earlier
+    if change > 0.5:  return "[bold green]🚀 accelerating[/bold green]"
+    if change > 0.1:  return "[green]↑ growing[/green]"
+    if change > -0.1: return "[dim]→ stable[/dim]"
+    if change > -0.4: return "[yellow]↓ slowing[/yellow]"
+    return "[red]📉 fading[/red]"
+
+def velocity_change(history):
+    if not history or len(history) < 3: return 0
+    recent  = history[-1]["views"] - history[-2]["views"]
+    earlier = history[-2]["views"] - history[-3]["views"]
+    if earlier == 0: return 0
+    return (recent - earlier) / earlier

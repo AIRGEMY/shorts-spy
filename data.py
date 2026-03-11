@@ -5,7 +5,7 @@ from rich.prompt import Prompt, Confirm
 
 from utils import (
     console, section, fmt, days_ago, views_per_day, like_ratio,
-    age_str,
+    age_str, velocity_label, velocity_change,
     load_cache, save_cache, load_notes, save_notes, load_remakes, save_remakes,
     PRESETS_FILE, db_file, SPIKE_MIN_GROWTH, SPIKE_MIN_PCT,
 )
@@ -183,4 +183,3 @@ def export_csv(rows):
                 "thumb_face_pct":th.get("face_pct",""),"thumb_has_text":"yes" if th.get("high_contrast_pct",0)>20 else "no",
                 "thumb_color":th.get("dominant_color","")})
     console.print(f"  ✅  [green]Exported [bold]{len(rows)}[/bold] → [bold]{filename}[/bold][/green]")
-

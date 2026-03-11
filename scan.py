@@ -1,10 +1,14 @@
-import json, os, io, time
+import json, os, io, time, webbrowser
 from datetime import datetime, timezone
-from collections import defaultdict
+from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from rich.table import Table
+from rich.panel import Panel
+from rich.prompt import Prompt, Confirm
+from rich import box
 
 try:
     import requests as _req
@@ -15,7 +19,7 @@ except ImportError:
 
 from utils import (
     console, section, fmt, is_short, is_fresh_48h, like_ratio,
-    age_str, hype_label,
+    age_str, hype_label, velocity_label, velocity_change,
     load_cache, save_cache, load_freq, save_freq, load_config, save_config,
     send_discord, db_file, hof_file, days_ago,
     THUMB_OK,
@@ -338,3 +342,4 @@ def start_auto_scan():
 # ══════════════════════════════════════════════════════════════
 #  FILTERS
 # ══════════════════════════════════════════════════════════════
+

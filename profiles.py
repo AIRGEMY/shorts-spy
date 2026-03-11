@@ -102,7 +102,7 @@ def manage_profiles(create_new=False):
                     if _state._active_profile == name: _state._active_profile = None
                     console.print(f"  [green]Deleted '{name}'[/green]")
         elif ch == "q": break
-    return _active_profile
+    return state._active_profile
 
 # ══════════════════════════════════════════════════════════════
 #  CACHE: playlist IDs + subscriber counts
@@ -117,16 +117,3 @@ def get_playlist_id(youtube, channel_id, cache):
         cache.setdefault("playlists", {})[channel_id] = pl_id
         return pl_id
     except: return None
-
-def fetch_subscriber_counts(channel_ids, cache):
-    missing = [cid for cid in channel_ids if cid and cid not in cache.get("subs", {})]
-    if not missing: return
-    youtube = build("youtube", "v3", developerKey=API_KEY)
-    for i in range(0, len(missing), 50):
-        try:
-            res = youtube.channels().list(part="statistics", id=",".join(missing[i:i+50])).execute()
-            for item in res.get("items", []):
-                cache.setdefault("subs", {})[item["id"]] = int(item["statistics"].get("subscriberCount", 0))
-        except: pass
-
-# ══════════════════════════════════════════════════════════════

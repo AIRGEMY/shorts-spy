@@ -1,12 +1,13 @@
-import json, os, statistics
+import json, os, re, html, statistics, webbrowser
 from datetime import datetime, timezone
 from collections import defaultdict, Counter
 
 from utils import (
     console, section, fmt, age_str, hype_label, days_ago,
-    load_notes, load_remakes, load_cache, db_file,
+    load_notes, load_remakes, load_cache, db_file, hof_file,
     DAYS,
 )
+from rich.prompt import Prompt, Confirm
 from trends import _compute_trend_radar_data
 from benchmarking import _compute_benchmarks
 from freq import _analyse_freq, load_freq
@@ -258,7 +259,7 @@ def generate_web_dashboard(rows):
     bench_js        = json.dumps(bench_data)
     hof_js          = json.dumps(hof_data)
 
-    profile_label = html.escape(_active_profile or "Default")
+    profile_label = html.escape(state._active_profile or "Default")
     scan_time     = datetime.now().strftime("%b %d, %Y · %H:%M")
     total         = len(payload)
     viral_count   = sum(1 for r in payload if r["score"] >= 3)
@@ -1443,7 +1444,8 @@ renderVideos()
 </body>
 </html>"""
 
-    fname = f"shorts_dashboard_{datetime.now().strftime('%Y%m%d_%H%M')}.html"
+    os.makedirs("dashboards", exist_ok=True)
+    fname = os.path.join("dashboards", f"shorts_dashboard_{datetime.now().strftime('%Y%m%d_%H%M')}.html")
     with open(fname, "w", encoding="utf-8") as f:
         f.write(html_content)
     console.print(f"  ✅  [green]Generated → [bold]{fname}[/bold][/green]")

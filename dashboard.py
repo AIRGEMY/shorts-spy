@@ -1,8 +1,9 @@
-import json, os, statistics
+import json, os, statistics, webbrowser
 from datetime import datetime, timezone
 from rich.prompt import Prompt, Confirm
 from rich.table import Table
 from rich.panel import Panel
+from rich.columns import Columns
 from rich import box
 
 from utils import (
@@ -10,6 +11,7 @@ from utils import (
     load_notes, save_notes, db_file, load_cache,
     TOP_N, HOF_FILE,
 )
+from analysis import posting_time_analysis
 import state
 
 RANKINGS = [
