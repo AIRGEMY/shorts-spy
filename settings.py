@@ -3,7 +3,6 @@ from rich.prompt import Prompt
 
 from utils import console, section, fmt, load_config, save_config, send_discord, THUMB_OK, PRESETS_FILE
 from data import load_presets
-import state
 
 def show_settings():
     while True:

@@ -9,7 +9,6 @@ from utils import (
 )
 from scan import analyze_thumbnail, fetch_subscriber_counts, thumb_summary
 from data import log_remake
-import state
 
 def detect_format(title):
     t=title.lower()

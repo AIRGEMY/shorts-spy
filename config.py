@@ -6,7 +6,10 @@
 
 # ── YouTube Data API v3 key ────────────────────────────────────
 # Get one free at https://console.cloud.google.com/
-API_KEY = "AIzaSyD2G3VWv3AyU1sa1fpOcoAsm0AtJg-cd98"
+# Set via environment variable: export YOUTUBE_API_KEY="your_key_here"
+# Or paste directly below (never commit a real key to git!)
+import os as _os
+API_KEY = _os.environ.get("YOUTUBE_API_KEY", "")
 
 # ── Your own channel ID (used for benchmarking) ───────────────
 YOUR_CHANNEL = "UUjHaiSX0jk8RYKmCvy5LKQg"

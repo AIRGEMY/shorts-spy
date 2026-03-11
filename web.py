@@ -1,13 +1,16 @@
-import json, os, re, html, statistics, webbrowser
-from datetime import datetime, timezone
+import json, os, statistics, re, html, webbrowser
 from collections import defaultdict, Counter
+from datetime import datetime
 
 from utils import (
-    console, section, fmt, age_str, hype_label, days_ago,
-    load_notes, load_remakes, load_cache, db_file, hof_file,
+    console, section, age_str, days_ago,
+    load_notes, load_remakes, hof_file, db_file,
     DAYS,
 )
-from rich.prompt import Prompt, Confirm
+from velocity  import _compute_velocity_data
+from wordpower import _compute_word_performance
+from remakroi  import _compute_remake_roi
+from rich.prompt import Confirm
 from trends import _compute_trend_radar_data
 from benchmarking import _compute_benchmarks
 from freq import _analyse_freq, load_freq
@@ -89,7 +92,6 @@ def _compute_channel_summary(rows):
     return result
 
 def _compute_brainstorm(rows):
-    import math
     def norm(val,mn,mx): return 0.5 if mx==mn else max(0.0,min(1.0,(val-mn)/(mx-mn)))
     vpds=[r["vpd"] for r in rows]; lrs=[r["like_ratio"] for r in rows]
     coms=[r["comments"] for r in rows]; scs=[r["score"] for r in rows]
@@ -240,6 +242,10 @@ def generate_web_dashboard(rows):
     trend_data      = _compute_trend_radar_data(rows, window_days=7)
     freq_data       = _compute_freq_data()
     bench_data      = _compute_benchmark_data(rows)
+    with open(db_file()) as _f: _vel_db = json.load(_f) if os.path.exists(db_file()) else {}
+    velocity_data               = _compute_velocity_data(_vel_db)
+    wordpower_data, wp_global   = _compute_word_performance(rows)
+    remake_roi_data             = _compute_remake_roi()
     hof_data        = []
     hf = hof_file()
     if os.path.exists(hf):
@@ -257,7 +263,11 @@ def generate_web_dashboard(rows):
     trend_js        = json.dumps(trend_data)
     freq_js         = json.dumps(freq_data)
     bench_js        = json.dumps(bench_data)
-    hof_js          = json.dumps(hof_data)
+    hof_js              = json.dumps(hof_data)
+    velocity_js         = json.dumps(velocity_data)
+    wordpower_js        = json.dumps(wordpower_data)
+    wp_global_js        = json.dumps(wp_global)
+    remake_roi_js       = json.dumps(remake_roi_data)
 
     profile_label = html.escape(state._active_profile or "Default")
     scan_time     = datetime.now().strftime("%b %d, %Y · %H:%M")
@@ -558,6 +568,43 @@ input:focus{{border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,232,181,.08)
 .empty{{padding:60px;text-align:center;color:var(--muted)}}
 .empty-icon{{font-size:36px;margin-bottom:10px}}
 
+/* ── VELOCITY curves ── */
+.vel-card{{background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:18px;margin-bottom:10px}}
+.vel-header{{display:flex;align-items:center;gap:12px;margin-bottom:10px}}
+.vel-ch{{font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:2px;text-transform:uppercase}}
+.vel-title{{font-size:15px;font-weight:600;color:#fff}}
+.vel-meta{{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:12px}}
+.vel-m{{font-family:var(--mono);font-size:12px;color:var(--muted2)}}
+.vel-svg{{width:100%;height:80px;overflow:visible}}
+.vel-badge{{display:inline-block;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:700}}
+.vel-accel{{background:rgba(0,232,181,.1);color:var(--accent);border:1px solid rgba(0,232,181,.3)}}
+.vel-grow{{background:rgba(79,142,247,.1);color:var(--blue);border:1px solid rgba(79,142,247,.3)}}
+.vel-hold{{background:var(--s2);color:var(--muted2);border:1px solid var(--border)}}
+.vel-slow{{background:rgba(245,183,0,.1);color:var(--accent3);border:1px solid rgba(245,183,0,.3)}}
+.vel-fade{{background:rgba(255,55,95,.1);color:var(--accent2);border:1px solid rgba(255,55,95,.3)}}
+/* ── WORD POWER ── */
+.wp-row{{display:flex;align-items:center;gap:10px;margin-bottom:8px;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--s1)}}
+.wp-rank{{font-family:var(--mono);font-size:12px;color:var(--muted);min-width:28px;text-align:right}}
+.wp-word{{font-family:var(--mono);font-size:14px;font-weight:700;min-width:120px;color:var(--accent)}}
+.wp-bar-track{{flex:1;height:10px;background:var(--s2);border-radius:5px;overflow:hidden}}
+.wp-bar-fill{{height:100%;border-radius:5px}}
+.wp-mult{{font-family:var(--mono);font-size:13px;font-weight:700;min-width:54px;text-align:right}}
+.wp-pct{{font-family:var(--mono);font-size:11px;min-width:54px;text-align:right}}
+.wp-cnt{{font-family:var(--mono);font-size:11px;color:var(--muted);min-width:46px;text-align:right}}
+.wp-best{{font-family:var(--mono);font-size:11px;color:var(--muted);min-width:54px;text-align:right}}
+/* ── REMAKE ROI ── */
+.roi-stat-row{{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:20px}}
+.roi-stat{{background:var(--s1);border:1px solid var(--border);border-radius:9px;padding:14px 20px;text-align:center;min-width:100px}}
+.roi-sv{{font-family:var(--mono);font-size:26px;font-weight:700;line-height:1}}
+.roi-sl{{font-size:10px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-top:4px}}
+.roi-bar-row{{display:flex;align-items:center;gap:10px;margin-bottom:8px}}
+.roi-name{{font-size:13px;min-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.roi-bar-track{{flex:1;height:12px;background:var(--s2);border-radius:6px;overflow:hidden;position:relative}}
+.roi-bar-fill{{height:100%;border-radius:6px;position:absolute;left:0;top:0}}
+.roi-pct{{font-family:var(--mono);font-size:13px;font-weight:700;min-width:42px;text-align:right}}
+.roi-n{{font-family:var(--mono);font-size:11px;color:var(--muted);min-width:36px;text-align:right}}
+.roi-tl-row{{display:flex;align-items:center;gap:10px;margin-bottom:6px}}
+.roi-tl-n{{font-family:var(--mono);font-size:11px;color:var(--muted);min-width:62px}}
 @media(max-width:800px){{
   body{{flex-direction:column;height:auto;overflow:auto}}
   .leftnav{{width:100%;height:auto;flex-direction:row;flex-wrap:wrap;position:relative;overflow:visible}}
@@ -603,6 +650,11 @@ input:focus{{border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,232,181,.08)
   <div class="nav-divider"></div>
   <div class="nav-group-label">Records</div>
   <button class="nav-tab" onclick="showTab('hof')"><span class="nav-icon">🏆</span>Hall of Fame</button>
+  <div class="nav-divider"></div>
+  <div class="nav-group-label">Deep Dive</div>
+  <button class="nav-tab" onclick="showTab('velocity')"><span class="nav-icon">📈</span>Velocity</button>
+  <button class="nav-tab" onclick="showTab('wordpower')"><span class="nav-icon">🔤</span>Word Power</button>
+  <button class="nav-tab" onclick="showTab('remakeROI')"><span class="nav-icon">💰</span>Remake ROI</button>
 
   <div class="nav-spacer"></div>
 
@@ -736,6 +788,18 @@ input:focus{{border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,232,181,.08)
   <div class="apage"><div class="apage-title">Hall of Fame — All-Time Viral</div><div id="hofContent"></div></div>
 </div>
 
+<!-- ════ PAGE: VELOCITY ════ -->
+<div class="page" id="page-velocity">
+  <div class="apage"><div class="apage-title">📈 Velocity Curves — Still Climbing or Already Dead?</div><div id="velocityContent"></div></div>
+</div>
+<!-- ════ PAGE: WORD POWER ════ -->
+<div class="page" id="page-wordpower">
+  <div class="apage"><div class="apage-title">🔤 Word Power — Which Title Words Drive More Views?</div><div id="wordpowerContent"></div></div>
+</div>
+<!-- ════ PAGE: REMAKE ROI ════ -->
+<div class="page" id="page-remakeROI">
+  <div class="apage"><div class="apage-title">💰 Remake ROI — Win Rate by Format · Channel · Saturation</div><div id="remakeROIContent"></div></div>
+</div>
 <!-- MODAL -->
 <div id="modalWrap" style="display:none"></div>
 
@@ -753,6 +817,10 @@ const TRENDS      = {trend_js};
 const FREQ        = {freq_js};
 const BENCHMARK   = {bench_js};
 const HOF         = {hof_js};
+const VELOCITY    = {velocity_js};
+const WORDPOWER   = {wordpower_js};
+const WORD_GLOBAL = {wp_global_js};
+const REMAKE_ROI  = {remake_roi_js};
 const DAYS        = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 
 // ── STATE ──
@@ -824,7 +892,8 @@ function showTab(id) {{
   const renders = {{
     titles:renderTitles, hashtags:renderHashtags, thumbnails:renderThumbnails,
     channels:renderChannels, timing:renderTiming, brainstorm:renderBrainstorm,
-    hof:renderHOF, trends:renderTrends, freq:renderFreq, benchmark:renderBenchmark
+    hof:renderHOF, trends:renderTrends, freq:renderFreq, benchmark:renderBenchmark,
+    velocity:renderVelocity, wordpower:renderWordPower, remakeROI:renderRemakeROI
   }}
   if (renders[id]) renders[id]()
 }}
@@ -1435,6 +1504,218 @@ function renderHOF() {{
         <a href="https://youtube.com/shorts/${{v.id}}" target="_blank" style="font-family:var(--mono);font-size:10px;color:var(--accent)">▶ Open</a>
       </div>
     </div>`).join("")
+}}
+
+
+// ══════════════════════════════════════════════════════════════
+// ★ VELOCITY CURVES
+// ══════════════════════════════════════════════════════════════
+function renderVelocity() {{
+  const wrap = document.getElementById("velocityContent")
+  if (!VELOCITY.length) {{
+    wrap.innerHTML = `<div class="empty"><div class="empty-icon">📈</div><p>Need 2+ scans to build velocity history.</p></div>`; return
+  }}
+  function velStatus(pts) {{
+    const seq = pts.map(p => p.views)
+    if (seq.length < 2) return {{cls:"vel-hold",label:"→ Holding",color:"var(--muted2)"}}
+    if (seq.length === 2) return seq[1]>seq[0]?{{cls:"vel-grow",label:"↑ Growing",color:"var(--blue)"}}:{{cls:"vel-hold",label:"→ Flat",color:"var(--muted2)"}}
+    const d1=seq[seq.length-1]-seq[seq.length-2], d2=seq[seq.length-2]-seq[seq.length-3]
+    if (d2<=0) return {{cls:"vel-grow",label:"↑ Growing",color:"var(--blue)"}}
+    const chg=(d1-d2)/d2
+    if (chg>0.5)  return {{cls:"vel-accel",label:"🚀 Accelerating",color:"var(--accent)"}}
+    if (chg>0.1)  return {{cls:"vel-grow", label:"↑ Still Growing",color:"var(--blue)"}}
+    if (chg>-0.2) return {{cls:"vel-hold", label:"→ Holding",       color:"var(--muted2)"}}
+    if (chg>-0.5) return {{cls:"vel-slow", label:"↓ Slowing",       color:"var(--accent3)"}}
+    return            {{cls:"vel-fade", label:"📉 Fading",        color:"var(--accent2)"}}
+  }}
+  function svgLine(points, color, peakColor) {{
+    if (points.length < 2) return ''
+    const W=400,H=70,PAD=4
+    const views=points.map(p=>p.views), minV=Math.min(...views), maxV=Math.max(...views), range=maxV-minV||1
+    const xs=points.map((_,i)=>PAD+(i/(points.length-1))*(W-PAD*2))
+    const ys=views.map(v=>H-PAD-((v-minV)/range)*(H-PAD*2))
+    let area=`M${{xs[0]}},${{H-PAD}}`; xs.forEach((x,i)=>{{area+=` L${{x}},${{ys[i]}}`}}); area+=` L${{xs[xs.length-1]}},${{H-PAD}} Z`
+    let line=`M${{xs[0]}},${{ys[0]}}`; xs.forEach((x,i)=>{{if(i>0)line+=` L${{x}},${{ys[i]}}`}})
+    const peakI=views.indexOf(maxV), latI=views.length-1
+    return `<svg viewBox="0 0 ${{W}} ${{H}}" class="vel-svg" preserveAspectRatio="none">
+      <defs><linearGradient id="vg${{peakI}}" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="${{color}}" stop-opacity="0.25"/>
+        <stop offset="100%" stop-color="${{color}}" stop-opacity="0.02"/>
+      </linearGradient></defs>
+      <path d="${{area}}" fill="url(#vg${{peakI}})"/>
+      <path d="${{line}}" fill="none" stroke="${{color}}" stroke-width="2" stroke-linejoin="round"/>
+      <circle cx="${{xs[peakI]}}" cy="${{ys[peakI]}}" r="4" fill="${{peakColor}}" stroke="var(--bg)" stroke-width="1.5"/>
+      <circle cx="${{xs[latI]}}"  cy="${{ys[latI]}}"  r="3" fill="${{color}}"     stroke="var(--bg)" stroke-width="1.5"/>
+    </svg>`
+  }}
+  const accel=VELOCITY.filter(v=>velStatus(v.points).cls==="vel-accel").length
+  const fading=VELOCITY.filter(v=>velStatus(v.points).cls==="vel-fade").length
+  let h=`<div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:20px">
+    <div style="background:rgba(0,232,181,.08);border:1px solid rgba(0,232,181,.25);border-radius:8px;padding:10px 18px;text-align:center">
+      <div style="font-family:var(--mono);font-size:22px;font-weight:700;color:var(--accent)">${{accel}}</div>
+      <div style="font-size:11px;color:var(--muted)">ACCELERATING</div></div>
+    <div style="background:rgba(255,55,95,.08);border:1px solid rgba(255,55,95,.25);border-radius:8px;padding:10px 18px;text-align:center">
+      <div style="font-family:var(--mono);font-size:22px;font-weight:700;color:var(--accent2)">${{fading}}</div>
+      <div style="font-size:11px;color:var(--muted)">FADING</div></div>
+    <div style="background:var(--s1);border:1px solid var(--border);border-radius:8px;padding:10px 18px;text-align:center">
+      <div style="font-family:var(--mono);font-size:22px;font-weight:700;color:#fff">${{VELOCITY.length}}</div>
+      <div style="font-size:11px;color:var(--muted)">TRACKED</div></div>
+  </div>`
+  VELOCITY.slice(0,25).forEach((v,i)=>{{
+    const st=velStatus(v.points), lineColor=st.color, peakColor=st.cls==="vel-accel"?"#fff":lineColor
+    const meTag=v.is_mine?`<span class="badge b-me" style="margin-left:6px">★YOU</span>`:''
+    const growth=v.points[v.points.length-1].views-v.points[0].views
+    h+=`<div class="vel-card">
+      <div class="vel-header">
+        <div style="font-family:var(--mono);font-size:18px;font-weight:700;color:var(--border2)">#${{i+1}}</div>
+        <div>
+          <div class="vel-ch">${{v.channel}}${{meTag}}</div>
+          <div class="vel-title">${{v.title}}</div>
+        </div>
+        <div style="margin-left:auto"><span class="vel-badge ${{st.cls}}">${{st.label}}</span></div>
+      </div>
+      <div class="vel-meta">
+        <span class="vel-m" style="color:#fff">👀 ${{fmt(v.views)}}</span>
+        <span class="vel-m">📊 ${{v.points.length}} scans</span>
+        <span class="vel-m" style="color:${{growth>=0?"var(--accent)":"var(--accent2)"}}">${{growth>=0?"+":""}}${{fmt(growth)}} since first scan</span>
+      </div>
+      ${{svgLine(v.points,lineColor,peakColor)}}
+      <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:4px">
+        <span>scan 1</span><span>▸ latest</span></div>
+      <a href="https://youtube.com/shorts/${{v.id}}" target="_blank"
+         style="display:inline-flex;align-items:center;gap:6px;margin-top:10px;font-family:var(--mono);font-size:11px;color:var(--accent)">▶ Open Short</a>
+    </div>`
+  }})
+  wrap.innerHTML = h
+}}
+
+// ══════════════════════════════════════════════════════════════
+// ★ WORD POWER
+// ══════════════════════════════════════════════════════════════
+function renderWordPower() {{
+  const wrap = document.getElementById("wordpowerContent")
+  if (!WORDPOWER.length) {{
+    wrap.innerHTML = `<div class="empty"><div class="empty-icon">🔤</div><p>Not enough data yet — scan more channels first.</p></div>`; return
+  }}
+  const topWords = WORDPOWER.filter(w=>w.multiplier>=1.0).slice(0,40)
+  const badWords = [...WORDPOWER].filter(w=>w.count>=5&&w.multiplier<1.0).sort((a,b)=>a.multiplier-b.multiplier).slice(0,15)
+  const maxMult  = topWords[0]?.multiplier||1
+  function wordRow(w,rank,isGood) {{
+    const pct   = isGood?Math.round((w.multiplier/maxMult)*100):Math.round((1-w.multiplier)*100)
+    const color = isGood?(w.multiplier>=2?"linear-gradient(90deg,var(--accent),#00ffaa)":w.multiplier>=1.5?"linear-gradient(90deg,var(--blue),var(--accent))":"linear-gradient(90deg,var(--border2),var(--blue))"):"linear-gradient(90deg,var(--accent2),#ff6688)"
+    const delta = Math.round((w.multiplier-1)*100)
+    const dStr  = (delta>=0?"+":"")+delta+"%"
+    const dColor= isGood?(delta>=50?"var(--accent)":"var(--muted2)"):"var(--accent2)"
+    const mColor= isGood?(w.multiplier>=2?"var(--accent)":w.multiplier>=1.3?"var(--blue)":"var(--text)"):"var(--accent2)"
+    return `<div class="wp-row">
+      <div class="wp-rank">${{rank}}</div>
+      <div class="wp-word" style="color:${{mColor}}">${{w.word}}</div>
+      <div class="wp-bar-track"><div class="wp-bar-fill" style="width:${{pct}}%;background:${{color}}"></div></div>
+      <div class="wp-mult" style="color:${{mColor}}">${{w.multiplier.toFixed(2)}}×</div>
+      <div class="wp-pct" style="color:${{dColor}}">${{dStr}}</div>
+      <div class="wp-cnt">${{w.count}} uses</div>
+      <div class="wp-best">best ${{fmt(w.best)}}</div>
+    </div>`
+  }}
+  let h=`<div style="background:var(--s1);border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:20px;display:flex;gap:20px;flex-wrap:wrap">
+    <div><span style="font-family:var(--mono);font-size:22px;font-weight:700;color:#fff">${{fmt(WORD_GLOBAL)}}</span>
+         <div style="font-size:10px;color:var(--muted);letter-spacing:2px">GLOBAL AVG</div></div>
+    <div><span style="font-family:var(--mono);font-size:22px;font-weight:700;color:var(--accent)">${{topWords.length}}</span>
+         <div style="font-size:10px;color:var(--muted);letter-spacing:2px">POWER WORDS</div></div>
+    <div><span style="font-family:var(--mono);font-size:22px;font-weight:700;color:var(--accent2)">${{badWords.length}}</span>
+         <div style="font-size:10px;color:var(--muted);letter-spacing:2px">AVOID WORDS</div></div>
+    <div style="flex:1;min-width:200px;font-size:12px;color:var(--muted2);display:flex;align-items:center">
+      Multiplier = avg views when a video's title contains this word ÷ global avg. Min 3 uses.</div></div>
+  <div class="section-grid">
+    <div class="acard"><div class="acard-title">🚀 Power Words — Add These to Titles</div>
+    ${{topWords.map((w,i)=>wordRow(w,i+1,true)).join('')}}</div>
+    <div class="acard"><div class="acard-title">⚠ Avoid Words — Correlated With Lower Views</div>
+    ${{badWords.length?badWords.map((w,i)=>wordRow(w,i+1,false)).join(''):'<div class="empty"><p>Not enough penalty-word data yet.</p></div>'}}</div>
+  </div>
+  <div class="acard" style="margin-top:20px"><div class="acard-title">Top 20 Power Words at a Glance</div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px;padding:10px 0">
+  ${{topWords.slice(0,20).map(w=>{{
+    const sz=11+Math.round((w.multiplier/maxMult)*10)
+    const a=0.15+(w.multiplier/maxMult)*0.55
+    const c=w.multiplier>=2?"var(--accent)":w.multiplier>=1.5?"var(--blue)":"var(--text)"
+    return `<div style="padding:6px 14px;border-radius:20px;background:rgba(0,232,181,${{a.toFixed(2)}});border:1px solid rgba(0,232,181,${{(a*1.5).toFixed(2)}});font-family:var(--mono);font-size:${{sz}}px;font-weight:700;color:${{c}};cursor:default" title="${{w.multiplier.toFixed(2)}}× · ${{w.count}} uses">${{w.word}}</div>`
+  }}).join('')}}
+  </div></div>`
+  wrap.innerHTML = h
+}}
+
+// ══════════════════════════════════════════════════════════════
+// ★ REMAKE ROI
+// ══════════════════════════════════════════════════════════════
+function renderRemakeROI() {{
+  const wrap = document.getElementById("remakeROIContent")
+  const roi = REMAKE_ROI
+  if (!roi) {{
+    wrap.innerHTML = `<div class="empty"><div class="empty-icon">💰</div><p>No remakes logged yet.<br><span style="font-size:12px;color:var(--muted)">From Brainstorm, open a video and log it as a remake.</span></p></div>`; return
+  }}
+  function roiColor(r) {{
+    if (r>=65) return {{stroke:"var(--accent)", fill:"rgba(0,232,181,.15)"}}
+    if (r>=45) return {{stroke:"var(--accent3)",fill:"rgba(245,183,0,.12)"}}
+    return          {{stroke:"var(--accent2)",fill:"rgba(255,55,95,.12)"}}
+  }}
+  function groupChart(title,items) {{
+    const max=Math.max(...items.map(x=>x.success_rate),1)
+    let h=`<div class="acard"><div class="acard-title">${{title}}</div>`
+    items.forEach(d=>{{
+      const c=roiColor(d.success_rate), pct=Math.round(d.success_rate/max*100)
+      const avg=d.avg_pct!=null?` · avg ${{d.avg_pct.toFixed(0)}}% of source`:""
+      h+=`<div class="roi-bar-row">
+        <div class="roi-name">${{d.name}}</div>
+        <div class="roi-bar-track"><div class="roi-bar-fill" style="width:${{pct}}%;background:${{c.stroke}};opacity:.85"></div></div>
+        <div class="roi-pct" style="color:${{c.stroke}}">${{d.success_rate}}%</div>
+        <div class="roi-n">${{d.success}}/${{d.total}}</div>
+      </div><div style="font-size:10px;color:var(--muted);margin:-4px 0 8px 140px">${{avg}}</div>`
+    }})
+    return h+`</div>`
+  }}
+  let h=`<div class="roi-stat-row">
+    <div class="roi-stat" style="border-color:rgba(0,232,181,.3)"><div class="roi-sv" style="color:var(--accent)">${{roi.overall_rate}}%</div><div class="roi-sl">Win Rate</div></div>
+    <div class="roi-stat" style="border-color:rgba(0,232,181,.25)"><div class="roi-sv" style="color:var(--accent)">${{roi.success}}</div><div class="roi-sl">Wins</div></div>
+    <div class="roi-stat" style="border-color:rgba(255,55,95,.25)"><div class="roi-sv" style="color:var(--accent2)">${{roi.flop}}</div><div class="roi-sl">Flops</div></div>
+    <div class="roi-stat"><div class="roi-sv" style="color:var(--muted2)">${{roi.pending}}</div><div class="roi-sl">Pending</div></div>
+    <div class="roi-stat"><div class="roi-sv" style="color:#fff">${{roi.total}}</div><div class="roi-sl">Total</div></div>
+  </div>
+  <div class="section-grid">
+    ${{groupChart("By Format",roi.by_format)}}
+    ${{groupChart("By Source Size",roi.by_sat)}}
+  </div>
+  <div style="margin-top:20px">${{groupChart("By Source Channel (top picks)",roi.by_channel.slice(0,12))}}</div>`
+  if (roi.timeline&&roi.timeline.length>=3) {{
+    const tl=roi.timeline
+    h+=`<div class="acard" style="margin-top:20px"><div class="acard-title">Your Learning Curve (win rate over time)</div>
+    <p style="font-size:12px;color:var(--muted2);margin-bottom:12px">Are you getting better at picking winners?</p>`
+    tl.forEach(pt=>{{
+      const c=roiColor(pt.rate)
+      h+=`<div class="roi-tl-row">
+        <div class="roi-tl-n">Remake #${{pt.n}}</div>
+        <div class="roi-bar-track" style="height:10px"><div class="roi-bar-fill" style="width:${{pt.rate}}%;background:${{c.stroke}};opacity:.85"></div></div>
+        <div class="roi-pct" style="color:${{c.stroke}}">${{pt.rate}}%</div>
+      </div>`
+    }})
+    const first3=tl.slice(0,3).reduce((s,p)=>s+p.rate,0)/3, last3=tl.slice(-3).reduce((s,p)=>s+p.rate,0)/3
+    const improving=last3>first3+5, declining=last3<first3-5
+    h+=`<p style="margin-top:14px;font-size:13px;color:${{improving?"var(--accent)":declining?"var(--accent2)":"var(--muted2)"}}">${{improving?"📈 Win rate improving — sharper at picking winners.":declining?"📉 Win rate dropping — try different formats.":"→ Win rate stable. Experiment with formats."}}</p></div>`
+  }}
+  if (roi.all&&roi.all.length) {{
+    h+=`<div class="acard" style="margin-top:20px;overflow-x:auto"><div class="acard-title">All Logged Remakes</div>
+    <table class="ch-table"><thead><tr><th style="text-align:left">Source</th><th>Result</th><th>Source Views</th><th>Your Views</th><th>% of Source</th></tr></thead><tbody>`
+    roi.all.slice().sort((a,b)=>(b.logged_at||'').localeCompare(a.logged_at||'')).forEach(r=>{{
+      const res=r.result||"pending", rColor=res==="success"?"var(--accent)":res==="flop"?"var(--accent2)":"var(--muted2)"
+      const pctStr=r.your_views&&r.source_views?Math.round(r.your_views/r.source_views*100)+"%":"—"
+      h+=`<tr><td style="text-align:left">${{(r.source_channel||"?").slice(0,18)}} — ${{(r.source_title||"?").slice(0,28)}}</td>
+        <td><span style="color:${{rColor}};font-weight:700">${{res.toUpperCase()}}</span></td>
+        <td>${{r.source_views?fmt(r.source_views):"—"}}</td>
+        <td>${{r.your_views?fmt(r.your_views):"—"}}</td>
+        <td style="color:${{rColor}}">${{pctStr}}</td></tr>`
+    }})
+    h+=`</tbody></table></div>`
+  }}
+  wrap.innerHTML = h
 }}
 
 // ── INIT ──

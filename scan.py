@@ -7,26 +7,25 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from rich.table import Table
 from rich.panel import Panel
-from rich.prompt import Prompt, Confirm
+from rich.prompt import Prompt
 from rich import box
 
 try:
     import requests as _req
     from PIL import Image
-    THUMB_OK = True
 except ImportError:
-    THUMB_OK = False
+    pass
 
 from utils import (
     console, section, fmt, is_short, is_fresh_48h, like_ratio,
-    age_str, hype_label, velocity_label, velocity_change,
+    age_str,
     load_cache, save_cache, load_freq, save_freq, load_config, save_config,
     send_discord, db_file, hof_file, days_ago,
     THUMB_OK,
 )
 from config import (
     API_KEY, YOUR_CHANNEL, VIDEOS_PER_CHANNEL, MAX_VELOCITY_HISTORY,
-    HOF_THRESHOLD, HOF_FILE, SPIKE_MIN_GROWTH, SPIKE_MIN_PCT, TOP_N,
+    HOF_THRESHOLD, SPIKE_MIN_GROWTH, SPIKE_MIN_PCT,
 )
 import state
 from freq import _update_freq_tracker
@@ -86,29 +85,6 @@ def thumb_summary(t):
     parts.append("[white]bright[/white]" if bri>160 else "[dim]dark[/dim]" if bri<80 else "[dim]mid-tone[/dim]")
     parts.append(f"[dim]sat {t['saturation']:.0f}[/dim]")
     return "  ".join(parts)
-
-# ══════════════════════════════════════════════════════════════
-#  VELOCITY
-# ══════════════════════════════════════════════════════════════
-
-def velocity_label(history):
-    if not history or len(history) < 3: return "[dim]—[/dim]"
-    recent  = history[-1]["views"] - history[-2]["views"]
-    earlier = history[-2]["views"] - history[-3]["views"]
-    if earlier == 0: return "[dim]flat[/dim]"
-    change = (recent - earlier) / earlier
-    if change > 0.5:  return "[bold green]🚀 accelerating[/bold green]"
-    if change > 0.1:  return "[green]↑ growing[/green]"
-    if change > -0.1: return "[dim]→ stable[/dim]"
-    if change > -0.4: return "[yellow]↓ slowing[/yellow]"
-    return "[red]📉 fading[/red]"
-
-def velocity_change(history):
-    if not history or len(history) < 3: return 0
-    recent  = history[-1]["views"] - history[-2]["views"]
-    earlier = history[-2]["views"] - history[-3]["views"]
-    if earlier == 0: return 0
-    return (recent - earlier) / earlier
 
 # ══════════════════════════════════════════════════════════════
 #  SPIKE DETECTION
@@ -234,14 +210,16 @@ def do_scan(silent=False):
             "1. Go to [cyan]console.cloud.google.com[/cyan]\n"
             "2. Create project → enable 'YouTube Data API v3'\n"
             "3. Credentials → API key\n"
-            "4. Paste into API_KEY at the top of this file",
+            "4. Set env var: export YOUTUBE_API_KEY=your_key\n"
+            "   or paste directly into config.py",
             title="⚠  Need API Key", border_style="red")); return
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    db    = json.load(open(db_file())) if os.path.exists(db_file()) else {}
+    if os.path.exists(db_file()):
+        with open(db_file()) as f: db = json.load(f)
+    else:
+        db = {}
     cache = load_cache()
-    freq  = load_freq()   # NEW: load upload frequency history
+    freq  = load_freq()
     now   = datetime.now(timezone.utc).isoformat()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
@@ -254,6 +232,7 @@ def do_scan(silent=False):
 
     cfg=load_config(); webhook=cfg.get("discord_webhook",""); alert_views=cfg.get("alert_min_views",0)
     alert_days=cfg.get("alert_max_days",3); alerts_fired=[]; new_count=0; ch_counts={}
+    alerted_ids = set()  # prevent duplicate alerts per scan
 
     # Collect per-channel videos for freq tracker
     ch_videos_collected = defaultdict(list)
@@ -287,11 +266,18 @@ def do_scan(silent=False):
                 }
                 ch_videos_collected[v["channel"]].append(v["published"])
 
-    # ── NEW: Update upload frequency tracker ──
+                # ── Discord alert check ──
+                if (webhook and alert_views and vid not in alerted_ids
+                        and v["views"] >= alert_views
+                        and (days_ago(v.get("published", "")) or 999) <= alert_days):
+                    alerts_fired.append(v)
+                    alerted_ids.add(vid)
+
+    # ── Update upload frequency tracker ──
     _update_freq_tracker(freq, ch_videos_collected, today)
     save_freq(freq)
 
-    json.dump(db, open(db_file(),"w"), indent=2)
+    with open(db_file(), "w") as f: json.dump(db, f, indent=2)
     save_cache(cache)
 
     rows_for_hof = build_rows(db, cache)
@@ -311,7 +297,7 @@ def do_scan(silent=False):
             for s in spikes[:5]:
                 console.print(f"   [red]+{s['spike_pct']}%[/red]  [cyan]{s['channel'][:22]}[/cyan]  "
                               f"[white]{s['title'][:40]}[/white]  [dim]+{fmt(s.get('spike_growth',0))} views[/dim]")
-        console.print(f"\n  [bold]Shorts per channel:[/bold]\n")
+        console.print("\n  [bold]Shorts per channel:[/bold]\n")
         my_name = next((v["channel"] for v in db.values() if v.get("is_mine")), None)
         for ch, count in sorted(ch_counts.items(), key=lambda x: x[1], reverse=True):
             bar   = "█" * min(count, 40)

@@ -4,8 +4,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich import box
 
-from utils import console, section, fmt, load_freq, db_file, load_cache
-import state
+from utils import console, section, load_freq, db_file, load_cache
+from data import build_rows
 
 def _update_freq_tracker(freq, ch_videos_collected, today):
     """
@@ -13,7 +13,6 @@ def _update_freq_tracker(freq, ch_videos_collected, today):
     each of the last N weeks, derived from the video publish dates.
     ch_videos_collected: dict channel_name -> [published_iso, ...]
     """
-    now = datetime.now(timezone.utc)
     for ch_name, pub_dates in ch_videos_collected.items():
         entry = freq.setdefault(ch_name, {"weekly": {}, "last_seen": today})
         entry["last_seen"] = today

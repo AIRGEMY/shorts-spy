@@ -1,5 +1,4 @@
-import json, os, statistics, webbrowser
-from datetime import datetime, timezone
+import webbrowser
 from rich.prompt import Prompt, Confirm
 from rich.table import Table
 from rich.panel import Panel
@@ -7,12 +6,11 @@ from rich.columns import Columns
 from rich import box
 
 from utils import (
-    console, section, fmt, age_str, hype_label, days_ago,
-    load_notes, save_notes, db_file, load_cache,
-    TOP_N, HOF_FILE,
+    console, section, fmt, age_str, hype_label,
+    load_notes, TOP_N,
 )
+from data import add_note, log_remake
 from analysis import posting_time_analysis
-import state
 
 RANKINGS = [
     ("Most Views",             "👀", lambda r: r["views"], [

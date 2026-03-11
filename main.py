@@ -1,7 +1,6 @@
-import json, os, sys
+import json, os
 
-from utils import console, section, fmt, load_cache, save_cache, db_file, load_config
-from config import YOUR_CHANNEL
+from utils import console, fmt, load_cache, save_cache, db_file
 import state
 
 from profiles   import select_profile, manage_profiles
@@ -14,8 +13,11 @@ from brainstorm import ai_brainstorm
 from trends     import show_trend_radar
 from freq       import show_freq_tracker
 from benchmarking import show_benchmarking
-from web        import generate_web_dashboard
-from settings   import show_settings
+from web          import generate_web_dashboard
+from settings     import show_settings
+from velocity     import show_velocity_curves
+from wordpower    import show_word_performance
+from remakroi     import show_remake_roi
 
 from rich.panel import Panel
 from rich.prompt import Prompt
@@ -45,13 +47,17 @@ def main():
         console.print("  [cyan]14[/cyan] 📡  Trend Radar       [dim]topics blowing up across multiple channels[/dim]")
         console.print("  [cyan]15[/cyan] 📅  Upload Frequency  [dim]cadence · quiet channels · surge detection[/dim]")
         console.print("  [cyan]16[/cyan] ⚔️   Benchmarking      [dim]your stats vs every competitor metric[/dim]")
+        console.print("  [bold cyan]── v5 NEW ──[/bold cyan]")
+        console.print("  [cyan]17[/cyan] 📈  Velocity Curves   [dim]per-video view history · still climbing vs fading[/dim]")
+        console.print("  [cyan]18[/cyan] 🔤  Word Power        [dim]which title words drive more views[/dim]")
+        console.print("  [cyan]19[/cyan] 💰  Remake ROI        [dim]win rate by format · channel · saturation[/dim]")
         console.print("  [cyan]q[/cyan]  👋  Quit\n")
 
         choice=Prompt.ask("  Pick", default="2").strip().lower()
 
         if choice=="1": do_scan()
-        elif choice in ("2","3","4","5","9","10","14","15","16"):
-            needs_data = choice in ("2","3","4","5","9","10","14","16")
+        elif choice in ("2","3","4","5","9","10","14","15","16","17","18"):
+            needs_data = choice in ("2","3","4","5","9","10","14","16","17","18")
             if needs_data and not os.path.exists(db_file()):
                 console.print("\n  [red]No data — scan first (pick 1)[/red]\n"); continue
 
@@ -59,7 +65,8 @@ def main():
                 show_freq_tracker(None)
                 continue
 
-            data=json.load(open(db_file())); cache=load_cache()
+            with open(db_file()) as _f: data = json.load(_f)
+            cache=load_cache()
             channel_ids=list({v.get("channelId","") for v in data.values() if v.get("channelId")})
             fetch_subscriber_counts(channel_ids,cache); save_cache(cache)
             all_rows=build_rows(data,cache)
@@ -71,6 +78,8 @@ def main():
             elif choice=="10": export_csv(all_rows)
             elif choice=="14": show_trend_radar(all_rows)
             elif choice=="16": show_benchmarking(all_rows)
+            elif choice=="17": show_velocity_curves(all_rows)
+            elif choice=="18": show_word_performance(all_rows)
             else:
                 min_views,max_days=ask_filters(); rows=apply_filters(all_rows,min_views,max_days)
                 label=" + ".join(filter(None,[f">={fmt(min_views)}" if min_views else "",f"last {max_days}d" if max_days else ""])) or "all videos"
@@ -83,8 +92,9 @@ def main():
         elif choice=="11": start_auto_scan()
         elif choice=="12": manage_profiles()
         elif choice=="13": show_settings()
+        elif choice=="19": show_remake_roi([])
         elif choice=="q":  console.print("\n  [dim]Later! 👋[/dim]\n"); break
-        else: console.print("  [red]Type 1–16 or q[/red]")
+        else: console.print("  [red]Type 1–19 or q[/red]")
 
 
 if __name__=="__main__":

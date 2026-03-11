@@ -1,16 +1,14 @@
-import json, os, csv, statistics
+import json, os, csv
 from datetime import datetime, timezone
 
 from rich.prompt import Prompt, Confirm
 
 from utils import (
     console, section, fmt, days_ago, views_per_day, like_ratio,
-    age_str, velocity_label, velocity_change,
-    load_cache, save_cache, load_notes, save_notes, load_remakes, save_remakes,
-    PRESETS_FILE, db_file, SPIKE_MIN_GROWTH, SPIKE_MIN_PCT,
+    velocity_label, velocity_change,
+    load_cache, load_notes, save_notes, load_remakes, save_remakes,
+    PRESETS_FILE, SPIKE_MIN_GROWTH, SPIKE_MIN_PCT,
 )
-import state
-
 def load_presets(): return json.load(open(PRESETS_FILE)) if os.path.exists(PRESETS_FILE) else {}
 
 def save_preset(name, min_views, max_days):
@@ -67,21 +65,26 @@ def build_rows(data, cache=None):
         raw_score= v["views"] / avg
         subs     = subs_map.get(v.get("channelId",""), 0)
         adj_score= raw_score / (math.log10(max(subs,1000)/1000)+1) if subs>0 else raw_score
+        prev_views = v.get("prev_views", 0)
+        spike_growth = v.get("spike_growth", v.get("growth", 0))
+        is_spike = bool(
+            spike_growth >= SPIKE_MIN_GROWTH and
+            prev_views > 0 and
+            spike_growth / prev_views >= SPIKE_MIN_PCT
+        ) if prev_views else False
         rows.append({
             **v,
-            "score":     raw_score,
-            "adj_score": round(adj_score,2),
-            "subs":      subs,
-            "ch_avg":    avg,
-            "vpd":       views_per_day(v["views"], v.get("published")),
-            "like_ratio":like_ratio(v.get("likes",0), v.get("views",1)),
-            "is_spike":  (
-                v.get("spike_growth", v.get("growth",0)) >= SPIKE_MIN_GROWTH and
-                v.get("prev_views",0) > 0 and
-                v.get("spike_growth", v.get("growth",0)) / v.get("prev_views",1) >= SPIKE_MIN_PCT
-            ) if v.get("prev_views") else False,
-            "velocity":  velocity_label(v.get("view_history",[])),
-            "vel_change":velocity_change(v.get("view_history",[])),
+            "score":      raw_score,
+            "adj_score":  round(adj_score,2),
+            "subs":       subs,
+            "ch_avg":     avg,
+            "vpd":        views_per_day(v["views"], v.get("published")),
+            "like_ratio": like_ratio(v.get("likes",0), v.get("views",1)),
+            "is_spike":   is_spike,
+            "spike_growth": spike_growth if is_spike else 0,
+            "spike_pct":  round(spike_growth / prev_views * 100) if is_spike and prev_views else 0,
+            "velocity":   velocity_label(v.get("view_history",[])),
+            "vel_change": velocity_change(v.get("view_history",[])),
         })
     return rows
 

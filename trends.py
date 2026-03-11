@@ -8,7 +8,6 @@ from rich import box
 import webbrowser
 
 from utils import console, section, fmt
-import state
 
 def _extract_topic_keywords(title):
     """Extract meaningful topic keywords from a title, removing noise words."""
@@ -148,7 +147,7 @@ def show_trend_radar(rows):
             f"  [bold cyan]#{i}  \"{tr['keyword']}\"[/bold cyan]  [dim]— {tr['ch_count']} channels · {tr['vid_count']} videos · last {wd}d[/dim]",
             f"  [dim]Channels:[/dim] [yellow]{ch_list}[/yellow]",
             f"  [dim]Best video:[/dim] [white]{tr['best_title'][:50]}[/white]  [green]{fmt(tr['best_views'])} views[/green]",
-            f"  [dim]Top videos:[/dim]",
+            "  [dim]Top videos:[/dim]",
         ]
         for e in tr["entries"][:3]:
             lines.append(f"    [dim]{e['channel'][:20]}[/dim]  [white]{e['title'][:38]}[/white]  [dim]{fmt(e['views'])}[/dim]")

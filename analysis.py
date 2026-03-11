@@ -1,13 +1,12 @@
 import re, statistics
-from datetime import datetime, timezone
+from datetime import datetime
 from collections import defaultdict, Counter
 from rich.prompt import Prompt
 from rich.table import Table
 from rich.columns import Columns
 from rich import box
 
-from utils import console, section, fmt, days_ago, DAYS, THUMB_OK
-import state
+from utils import console, section, fmt, DAYS
 
 def title_pattern_cluster(rows):
     section("TITLE PATTERN ANALYSIS")

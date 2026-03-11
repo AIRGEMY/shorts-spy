@@ -6,7 +6,6 @@ from rich import box
 
 from utils import console, section, fmt
 from trends import _extract_topic_keywords
-import state
 
 def _compute_benchmarks(rows):
     """
@@ -179,7 +178,7 @@ def show_benchmarking(rows):
         console.print(t2)
 
     # ── Topic overlap ──
-    console.print(f"\n  [bold white]Your Top Topics vs Competitor Top Topics[/bold white]\n")
+    console.print("\n  [bold white]Your Top Topics vs Competitor Top Topics[/bold white]\n")
     t3 = Table(box=box.SIMPLE_HEAVY, border_style="bright_black", header_style="bold white")
     t3.add_column(f"★ {my_name[:20]} (by total views)", style="yellow", width=28)
     t3.add_column("Competitors (by total views)",        style="cyan",   width=28)
@@ -196,13 +195,13 @@ def show_benchmarking(rows):
 
     # ── Gap narrative ──
     avg_views_bm = bm["avg_views"]
-    console.print(f"\n  [bold white]Gap Summary[/bold white]\n")
+    console.print("\n  [bold white]Gap Summary[/bold white]\n")
     console.print(f"  Your avg views:       [bold yellow]{avg_views_bm['fmt_fn'](avg_views_bm['my_val'])}[/bold yellow]")
     console.print(f"  Competitor avg views: [cyan]{avg_views_bm['fmt_fn'](avg_views_bm['their_val'])}[/cyan]")
     if avg_views_bm['gap_ratio'] > 1:
         console.print(f"  Gap:                  [red]{avg_views_bm['gap_ratio']:.1f}× behind[/red]  [dim]({avg_views_bm['pct_behind']:.0f}% less)[/dim]")
     else:
-        console.print(f"  [bold green]  You're outperforming the competitor average! 🎉[/bold green]")
+        console.print("  [bold green]  You're outperforming the competitor average! 🎉[/bold green]")
 
     score_bm = bm["avg_score"]
     console.print(f"\n  Your avg hype score:  [bold yellow]{score_bm['fmt_fn'](score_bm['my_val'])}[/bold yellow]")

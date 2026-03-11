@@ -1,33 +1,23 @@
-import json, os, re, csv, io, statistics, time, html, webbrowser
-from datetime import datetime, timezone, timedelta
-from collections import defaultdict, Counter
+import json, os, re
+from datetime import datetime, timezone
 
 try:
     import isodate
-    from googleapiclient.discovery import build
-    from googleapiclient.errors import HttpError
     from rich.console import Console
-    from rich.table import Table
-    from rich.panel import Panel
-    from rich.prompt import Prompt, Confirm
-    from rich.columns import Columns
     from rich.rule import Rule
-    from rich import box
 except ImportError:
     print("Missing packages! Run: pip install google-api-python-client isodate rich schedule requests Pillow")
     import sys; sys.exit(1)
 
 try:
     import requests as _req
-    from PIL import Image
     THUMB_OK = True
 except ImportError:
     THUMB_OK = False
 
 from config import (
-    API_KEY, YOUR_CHANNEL,
-    VIDEOS_PER_CHANNEL, TOP_N,
-    HOF_THRESHOLD, SPIKE_MIN_GROWTH, SPIKE_MIN_PCT, MAX_VELOCITY_HISTORY,
+    TOP_N,
+    SPIKE_MIN_GROWTH, SPIKE_MIN_PCT,
     PROFILES_FILE, DB_FILE, HOF_FILE, CACHE_FILE,
     PRESETS_FILE, CONFIG_FILE, REMAKE_FILE, NOTES_FILE, FREQ_FILE,
     DAYS,
