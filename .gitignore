@@ -1,0 +1,27 @@
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+
+# ── Shorts Spy data files (local only, don't commit) ─────────
+spy_data*.json
+spy_hof*.json
+spy_cache.json
+spy_freq.json
+spy_notes.json
+spy_remakes.json
+spy_profiles.json
+spy_presets.json
+spy_config.json
+
+# ── Exports & brainstorm saves ────────────────────────────────
+*.csv
+brainstorm_*.txt
+dashboard_*.html
+
+# ── OS junk ───────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
