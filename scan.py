@@ -25,6 +25,7 @@ from config import (
     HOF_THRESHOLD, HOF_FILE, SPIKE_MIN_GROWTH, SPIKE_MIN_PCT, TOP_N,
 )
 import state
+from freq import _update_freq_tracker
 
 def get_playlist_id(youtube, channel_id, cache):
     if channel_id.startswith("UU"): return channel_id
@@ -336,4 +337,3 @@ def start_auto_scan():
 # ══════════════════════════════════════════════════════════════
 #  FILTERS
 # ══════════════════════════════════════════════════════════════
-
