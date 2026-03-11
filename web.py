@@ -1,10 +1,11 @@
 import json, os, statistics, re, html, webbrowser
 from collections import defaultdict, Counter
-from datetime import datetime
+from datetime import datetime, timezone
 
 from utils import (
     console, section, age_str, days_ago,
     load_notes, load_remakes, hof_file, db_file,
+    load_cache, save_cache,
     DAYS,
 )
 from velocity  import _compute_velocity_data
@@ -15,6 +16,53 @@ from trends import _compute_trend_radar_data
 from benchmarking import _compute_benchmarks
 from freq import _analyse_freq, load_freq
 import state
+
+try:
+    from brainstorm import (
+        exact_hook as _exact_hook,
+        exact_title as _exact_title,
+        exact_angle as _exact_angle,
+        detect_format as _bs_detect_format,
+        remake_score as _bs_remake_score,
+    )
+    _BS_OK = True
+except Exception:
+    _BS_OK = False
+
+def _fetch_pfps(channel_ids, cache):
+    """Fetch channel profile picture URLs from YouTube API and store in cache."""
+    from config import API_KEY
+    if not API_KEY: return
+    missing = [cid for cid in channel_ids if cid and cid not in cache.get("pfps", {})]
+    if not missing: return
+    try:
+        from googleapiclient.discovery import build
+        youtube = build("youtube", "v3", developerKey=API_KEY)
+        for i in range(0, len(missing), 50):
+            try:
+                res = youtube.channels().list(part="snippet", id=",".join(missing[i:i+50])).execute()
+                for item in res.get("items", []):
+                    thumbs = item.get("snippet", {}).get("thumbnails", {})
+                    url = (thumbs.get("medium") or thumbs.get("default") or {}).get("url", "")
+                    if url:
+                        cache.setdefault("pfps", {})[item["id"]] = url
+            except: pass
+        save_cache(cache)
+    except: pass
+
+def _last_scan_ago(rows):
+    """Return human-readable string like '6h ago' from most recent scanned_at."""
+    times = [r.get("scanned_at") for r in rows if r.get("scanned_at")]
+    if not times: return None
+    try:
+        latest = max(datetime.fromisoformat(t.replace("Z","+00:00")) for t in times)
+        diff = datetime.now(timezone.utc) - latest
+        s = int(diff.total_seconds())
+        if s < 60: return f"{s}s ago"
+        if s < 3600: return f"{s//60}m ago"
+        if s < 86400: return f"{s//3600}h ago"
+        return f"{s//86400}d ago"
+    except: return None
 
 def _compute_title_patterns(rows):
     def extract_pattern(title):
@@ -117,18 +165,81 @@ def _compute_brainstorm(rows):
         if any(x in t for x in ("challenge","i tried")): return "Challenge"
         if any(x in t for x in ("react","reacting")): return "Reaction"
         return "Other"
-    ranked=sorted(rows,key=composite,reverse=True)[:20]
+    def title_angles(r):
+        """Generate 3 title angle variations based on format and top words."""
+        fmt_name = detect_fmt(r["title"])
+        words = [w for w in r["title"].split() if len(w)>3][:4]
+        topic = " ".join(words[:2]) if words else "this"
+        angles = {
+            "POV":        [f"POV: You finally understand {topic}","Me every time {topic} happens","When {topic} goes wrong 💀"],
+            "Tutorial":   [f"How to actually do {topic}",f"The {topic} guide nobody shows you",f"Do THIS for {topic} (most don't)"],
+            "Ranking":    [f"Ranking every {topic} from worst to best",f"The REAL tier list for {topic}",f"Every {topic} ranked honestly"],
+            "Comparison": [f"{topic} — which is actually better?",f"I tested both {topic} so you don't have to",f"The truth about {topic}"],
+            "Reveal":     [f"The secret about {topic} nobody talks about",f"What they don't tell you about {topic}",f"I found out the truth about {topic}"],
+            "Challenge":  [f"I tried {topic} for 24 hours",f"Doing {topic} with no experience",f"Can you actually do {topic}? I tried"],
+            "Reaction":   [f"Reacting to the best {topic}",f"My honest reaction to {topic}",f"I watched {topic} so you don't have to"],
+            "Other":      [f"Why {topic} is actually insane",f"Nobody talks about {topic} enough",f"The {topic} video everyone needs to see"],
+        }
+        return angles.get(fmt_name, angles["Other"])
+
+    ranked=sorted(rows,key=composite,reverse=True)[:40]
     result=[]
     for r in ranked:
         kws=set(w.lower() for w in r["title"].split() if len(w)>3)
-        similar=sum(1 for o in rows if o["id"]!=r["id"] and
-            len(kws&set(w.lower() for w in o["title"].split() if len(w)>3))/max(len(kws),1)>=0.4)
-        result.append({"id":r["id"],"channel":r["channel"],"title":r["title"],"views":r["views"],
+        similar_vids=[o for o in rows if o["id"]!=r["id"] and
+            len(kws&set(w.lower() for w in o["title"].split() if len(w)>3))/max(len(kws),1)>=0.4]
+        similar=len(similar_vids)
+        # Opportunity score: high views, low saturation, recent
+        age=days_ago(r.get("published")) or 30
+        recency_bonus = max(0, 1 - age/90)
+        opp = round(min(100, int(
+            norm(r["score"],min(scs),max(scs))*40 +
+            max(0,(1-similar/10))*30 +
+            recency_bonus*15 +
+            norm(r["like_ratio"],min(lrs),max(lrs))*15
+        )))
+        # Full brainstorm.py strategy fields
+        rs_val      = _bs_remake_score(r, rows) if _BS_OK else opp
+        hook_txt    = _exact_hook(r)            if _BS_OK else ""
+        title_sug   = _exact_title(r)           if _BS_OK else ""
+        angle_txt   = _exact_angle(r)           if _BS_OK else ""
+
+        result.append({
+            "id":r["id"],"channel":r["channel"],"channelId":r.get("channelId",""),
+            "title":r["title"],"views":r["views"],
             "score":round(r["score"],2),"vpd":r["vpd"],"lr":round(r["like_ratio"],2),
-            "age":age_str(r.get("published")),"format":detect_fmt(r["title"]),
+            "age":age_str(r.get("published")),"age_days":age,
+            "published":r.get("published",""),
+            "format":detect_fmt(r["title"]),
             "success":success_pct(r),"repro":repro_score(r),"saturation":similar,
-            "is_spike":r.get("is_spike",False),"is_mine":r.get("is_mine",False)})
-    return result
+            "opportunity":opp,
+            "remake_score": rs_val,
+            "angles":title_angles(r),
+            "hook":       hook_txt,
+            "suggested_title": title_sug,
+            "angle":      angle_txt,
+            "is_spike":r.get("is_spike",False),"is_mine":r.get("is_mine",False),
+        })
+
+    # Gap finder: format+topic combos others do well but YOU haven't posted
+    my_formats = set(detect_fmt(r["title"]) for r in rows if r.get("is_mine"))
+    all_formats = {}
+    for r in rows:
+        if not r.get("is_mine"):
+            f = detect_fmt(r["title"])
+            if f not in all_formats:
+                all_formats[f] = {"views":0,"count":0,"examples":[]}
+            all_formats[f]["views"] += r["views"]
+            all_formats[f]["count"] += 1
+            if len(all_formats[f]["examples"]) < 2:
+                all_formats[f]["examples"].append({"title":r["title"],"views":r["views"],"channel":r["channel"],"channelId":r.get("channelId","")})
+    gaps = []
+    for f,d in sorted(all_formats.items(), key=lambda x:x[1]["views"], reverse=True):
+        if f not in my_formats:
+            gaps.append({"format":f,"avg_views":d["views"]//max(d["count"],1),"count":d["count"],"examples":d["examples"],"untapped":True})
+        elif d["count"]>0:
+            gaps.append({"format":f,"avg_views":d["views"]//max(d["count"],1),"count":d["count"],"examples":d["examples"],"untapped":False})
+    return {"cards":result,"gaps":gaps}
 
 def _compute_thumbnail_data(rows):
     wt=[r for r in rows if r.get("thumbnail")]
@@ -230,6 +341,7 @@ def generate_web_dashboard(rows):
             "growth":    r.get("growth", 0),
             "thumb_face": (r.get("thumbnail") or {}).get("face_pct", 0),
             "thumb_bri":  (r.get("thumbnail") or {}).get("brightness", 0),
+            "channelId": r.get("channelId", ""),
         })
 
     title_patterns  = _compute_title_patterns(rows)
@@ -268,9 +380,14 @@ def generate_web_dashboard(rows):
     wordpower_js        = json.dumps(wordpower_data)
     wp_global_js        = json.dumps(wp_global)
     remake_roi_js       = json.dumps(remake_roi_data)
+    _cache          = load_cache()
+    _channel_ids    = list({r.get("channelId","") for r in rows if r.get("channelId")})
+    _fetch_pfps(_channel_ids, _cache)
+    pfp_js          = json.dumps(_cache.get("pfps", {}))
 
     profile_label = html.escape(state._active_profile or "Default")
     scan_time     = datetime.now().strftime("%b %d, %Y · %H:%M")
+    last_scan_str   = _last_scan_ago(rows) or scan_time
     total         = len(payload)
     viral_count   = sum(1 for r in payload if r["score"] >= 3)
     spike_count   = sum(1 for r in payload if r["is_spike"])
@@ -386,7 +503,7 @@ input:focus{{border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,232,181,.08)
 .layout{{display:grid;grid-template-columns:250px 1fr;min-height:calc(100vh - 57px)}}
 .sidebar{{background:var(--s1);border-right:1px solid var(--border);padding:16px;overflow-y:auto;position:sticky;top:57px;height:calc(100vh - 57px)}}
 .sb-title{{font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:3px;text-transform:uppercase;margin:0 4px 10px;}}
-.ch-item{{display:flex;align-items:center;justify-content:space-between;padding:7px 9px;border-radius:6px;cursor:pointer;transition:.1s;border:1px solid transparent;margin-bottom:2px}}
+.ch-item{{display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:6px;cursor:pointer;transition:.1s;border:1px solid transparent;margin-bottom:2px}}
 .ch-item:hover{{background:var(--s2);border-color:var(--border)}}
 .ch-item.sel{{background:rgba(0,232,181,.07);border-color:rgba(0,232,181,.25)}}
 .ch-name{{font-size:12px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}}
@@ -406,18 +523,24 @@ input:focus{{border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,232,181,.08)
   background:var(--s2);border:1px solid var(--border);border-radius:9px;
   padding:13px 15px;margin-bottom:7px;cursor:pointer;transition:.13s;
   border-left:3px solid var(--border);
-  display:grid;grid-template-columns:34px 1fr;gap:0 11px;
+  display:grid;grid-template-columns:42px 1fr;gap:0 11px;
 }}
 .card:hover{{background:var(--s3);border-color:var(--border2);transform:translateX(2px)}}
 .card.hl{{border-left-color:#ff2244}}.card.hi{{border-left-color:#d44dff}}
 .card.hv{{border-left-color:#ff6600}}.card.hh{{border-left-color:#ffcc00}}
 .card.hr{{border-left-color:#44ff88}}.card.hn{{border-left-color:var(--border)}}
-.c-rank{{font-family:var(--mono);font-size:13px;color:var(--muted);padding-top:1px}}
+.c-rank-wrap{{display:flex;flex-direction:column;align-items:center;gap:4px;padding-top:1px}}
+.c-pfp{{width:32px;height:32px;border-radius:50%;object-fit:cover;border:1.5px solid var(--border2);background:var(--s3);flex-shrink:0}}
+.c-pfp-placeholder{{width:32px;height:32px;border-radius:50%;background:var(--s3);border:1.5px solid var(--border2);display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--muted);flex-shrink:0}}
+.c-rank{{font-family:var(--mono);font-size:10px;color:var(--muted);text-align:center;line-height:1}}
 .c-ch{{font-weight:600;font-size:13px;color:var(--accent);margin-right:6px}}
 .c-ch.mine{{color:var(--accent3)}}
 .c-top{{display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin-bottom:4px}}
 .c-title{{font-size:13px;color:var(--text);line-height:1.4;margin-bottom:7px}}
 .c-meta{{display:flex;gap:12px;flex-wrap:wrap}}
+/* channel sidebar pfp */
+.ch-pfp{{width:26px;height:26px;border-radius:50%;object-fit:cover;border:1px solid var(--border2);background:var(--s3);flex-shrink:0}}
+.ch-pfp-placeholder{{width:26px;height:26px;border-radius:50%;background:var(--s3);border:1px solid var(--border2);display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--muted);flex-shrink:0}}
 .m{{font-family:var(--mono);font-size:11px;color:var(--muted2)}}
 .m.w{{color:#fff}}.m.g{{color:var(--accent)}}.m.r{{color:var(--accent2)}}.m.y{{color:var(--accent3)}}.m.b{{color:var(--blue)}}
 .badge{{font-family:var(--mono);font-size:9px;padding:2px 6px;border-radius:4px;border:1px solid;white-space:nowrap;font-weight:700;letter-spacing:.3px}}
@@ -438,7 +561,7 @@ input:focus{{border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,232,181,.08)
 .overlay{{position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:300;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(5px)}}
 .modal{{background:var(--s1);border:1px solid var(--border2);border-radius:12px;padding:26px;max-width:500px;width:calc(100% - 32px);animation:mi .17s ease}}
 @keyframes mi{{from{{opacity:0;transform:scale(.95)}}to{{opacity:1;transform:scale(1)}}}}
-.modal-ch{{font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:2px;text-transform:uppercase;margin-bottom:5px}}
+.modal-ch{{font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:2px;text-transform:uppercase;margin-bottom:5px;display:flex;align-items:center;gap:8px}}
 .modal-t{{font-size:17px;font-weight:600;color:#fff;margin-bottom:18px;line-height:1.3}}
 .sg{{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-bottom:18px}}
 .sb{{background:var(--s2);border:1px solid var(--border);border-radius:7px;padding:9px 11px}}
@@ -472,37 +595,132 @@ input:focus{{border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,232,181,.08)
 
 /* channel table */
 .ch-table{{width:100%;border-collapse:collapse}}
-.ch-table th{{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--muted);text-transform:uppercase;padding:8px 10px;border-bottom:1px solid var(--border);text-align:right}}
-.ch-table th:first-child{{text-align:left}}
+.ch-table th{{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--muted);text-transform:uppercase;padding:8px 10px;border-bottom:1px solid var(--border);text-align:right;cursor:pointer;user-select:none;white-space:nowrap;transition:.15s}}
+.ch-table th:first-child{{text-align:left;cursor:default}}
+.ch-table th:not(:first-child):hover{{color:var(--text)}}
+.ch-table th.sort-asc::after{{content:" ▲";color:var(--accent2)}}
+.ch-table th.sort-desc::after{{content:" ▼";color:var(--accent)}}
 .ch-table td{{padding:9px 10px;border-bottom:1px solid var(--border);font-size:13px;text-align:right}}
 .ch-table td:first-child{{text-align:left;font-weight:500}}
 .ch-table tr:hover td{{background:var(--s2)}}
 .mine-row td:first-child{{color:var(--accent3)}}
+.ch-pfp-cell{{display:flex;align-items:center;gap:9px}}
 
-/* brainstorm cards */
-.bs-card{{background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:18px;margin-bottom:12px}}
-.bs-rank{{font-family:var(--mono);font-size:22px;font-weight:700;color:var(--border2);margin-bottom:8px}}
-.bs-channel{{font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:2px;text-transform:uppercase;margin-bottom:4px}}
-.bs-title{{font-size:16px;font-weight:600;color:#fff;margin-bottom:12px}}
-.bs-meta{{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px}}
-.bs-m{{font-family:var(--mono);font-size:12px;color:var(--muted2)}}
-.bs-m.g{{color:var(--accent)}}.bs-m.y{{color:var(--accent3)}}.bs-m.r{{color:var(--accent2)}}
-.progress-row{{display:flex;align-items:center;gap:12px;margin-bottom:8px}}
-.progress-lbl{{font-size:12px;color:var(--muted2);min-width:80px}}
-.progress-bar{{flex:1;height:6px;background:var(--s2);border-radius:3px;overflow:hidden}}
-.progress-fill{{height:100%;border-radius:3px}}
-.progress-val{{font-family:var(--mono);font-size:12px;min-width:40px;text-align:right}}
-.sat-badge{{display:inline-block;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;margin-bottom:10px}}
+/* ══ BRAINSTORM v5 ══ */
+.bs-card{{background:var(--s1);border:1px solid var(--border);border-radius:14px;margin-bottom:10px;position:relative;transition:.2s;overflow:hidden}}
+.bs-card:hover{{border-color:var(--border2)}}
+.bs-card.bs-done{{opacity:.28;filter:saturate(0)}}
+.bs-card.bs-pinned{{border-color:rgba(245,183,0,.5);box-shadow:0 0 0 1px rgba(245,183,0,.1)}}
+.bs-card-top{{padding:14px 16px 12px}}
+.bs-card-header{{display:flex;align-items:center;gap:10px;margin-bottom:11px}}
+.bs-score{{width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:14px;font-weight:800;flex-shrink:0;border:2px solid;line-height:1}}
+.bs-score-hot{{background:rgba(255,34,68,.12);color:#ff2244;border-color:rgba(255,34,68,.45)}}
+.bs-score-good{{background:rgba(245,183,0,.12);color:var(--accent3);border-color:rgba(245,183,0,.45)}}
+.bs-score-ok{{background:rgba(107,114,128,.1);color:var(--muted2);border-color:var(--border)}}
+.bs-hdr-right{{flex:1;min-width:0}}
+.bs-fmt-row{{display:flex;align-items:center;gap:6px;flex-wrap:wrap}}
+.bs-rank{{font-family:var(--mono);font-size:11px;color:var(--muted);background:var(--s2);padding:1px 7px;border-radius:4px;border:1px solid var(--border)}}
+.bs-channel{{font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:1.5px;text-transform:uppercase;display:flex;align-items:center;gap:6px;margin-bottom:4px}}
+.bs-title{{font-size:14px;font-weight:600;color:#fff;line-height:1.4;margin-bottom:8px}}
+.bs-meta{{display:flex;gap:10px;flex-wrap:wrap}}
+.bs-m{{font-family:var(--mono);font-size:11px;color:var(--muted2)}}
+.bs-m.g{{color:var(--accent)}}.bs-m.y{{color:var(--accent3)}}.bs-m.r{{color:var(--accent2)}}.bs-m.w{{color:#fff;font-weight:700}}
+/* card body: thumb + info */
+.bs-body-row{{display:flex;gap:12px;margin-bottom:10px}}
+.bs-thumb{{width:112px;height:63px;border-radius:7px;object-fit:cover;flex-shrink:0;border:1px solid var(--border)}}
+.bs-body-info{{flex:1;min-width:0}}
+/* sat + success row */
+.bs-sat-row{{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 16px;border-top:1px solid var(--border)}}
+.bs-succ-bar{{display:flex;align-items:center;gap:6px;margin-left:auto}}
+/* suggested title strip */
+.bs-sug-strip{{display:flex;align-items:center;gap:8px;padding:8px 16px;background:rgba(245,183,0,.04);border-top:1px solid rgba(245,183,0,.1)}}
+.bs-sug-label{{font-size:10px;font-family:var(--mono);color:var(--muted);letter-spacing:1px;text-transform:uppercase;flex-shrink:0}}
+.bs-sug-text{{flex:1;font-size:12px;font-weight:600;color:var(--accent3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+/* action bar */
+.bs-actions{{display:flex;gap:6px;align-items:center;padding:10px 16px;flex-wrap:wrap;border-top:1px solid var(--border)}}
+.bs-btn{{background:var(--s2);border:1px solid var(--border);color:var(--muted);font-size:11px;padding:5px 11px;border-radius:6px;cursor:pointer;transition:.1s;display:inline-flex;align-items:center;gap:5px;font-family:var(--sans)}}
+.bs-btn:hover{{border-color:var(--accent);color:var(--accent)}}
+.bs-btn.active{{background:rgba(0,232,181,.1);border-color:rgba(0,232,181,.3);color:var(--accent)}}
+.bs-btn.pin-active{{background:rgba(245,183,0,.1);border-color:rgba(245,183,0,.3);color:var(--accent3)}}
+.bs-btn-gen{{background:linear-gradient(135deg,rgba(0,232,181,.18),rgba(79,142,247,.18));border:1px solid rgba(0,232,181,.5);color:var(--accent);font-size:11px;font-weight:700;padding:5px 12px;border-radius:6px;cursor:pointer;transition:.2s;display:inline-flex;align-items:center;gap:5px;font-family:var(--sans)}}
+.bs-btn-gen:hover{{background:linear-gradient(135deg,rgba(0,232,181,.3),rgba(79,142,247,.3));border-color:var(--accent)}}
+.bs-btn-gen:disabled{{opacity:.5;cursor:wait}}
+.bs-open{{display:inline-flex;align-items:center;gap:5px;padding:5px 11px;border-radius:6px;background:#ff0000;color:#fff;font-size:11px;font-weight:600;border:none;cursor:pointer;text-decoration:none;transition:.1s}}
+.bs-open:hover{{background:#cc0000}}
+/* full brief panel */
+.bs-brief{{background:linear-gradient(160deg,rgba(0,232,181,.04),rgba(79,142,247,.04));border-top:1px solid rgba(79,142,247,.25);padding:16px 18px;display:none}}
+.bs-brief-loading{{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:13px;padding:6px 0}}
+.bs-brief-spin{{width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite}}
+@keyframes spin{{to{{transform:rotate(360deg)}}}}
+.bs-brief-section{{margin-bottom:14px}}
+.bs-brief-label{{font-size:10px;font-family:var(--mono);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;color:var(--blue);display:flex;align-items:center;gap:6px}}
+.bs-title-opt{{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:7px;margin-bottom:4px;border:1px solid var(--border);background:var(--s1);cursor:pointer;transition:.12s}}
+.bs-title-opt:hover{{border-color:var(--accent2);background:#0e1220}}
+.bs-title-opt-num{{font-size:10px;font-family:var(--mono);color:var(--muted);min-width:14px;flex-shrink:0}}
+.bs-title-opt-text{{flex:1;font-size:13px;font-weight:500;color:#fff}}
+.bs-hook-box{{background:var(--s1);border:1px solid rgba(0,232,181,.25);border-radius:8px;padding:12px 14px;font-size:13px;color:var(--text);line-height:1.65;border-left:3px solid var(--accent)}}
+.bs-shot-list{{display:flex;flex-direction:column;gap:5px}}
+.bs-shot-item{{display:flex;gap:10px;padding:6px 10px;border-radius:6px;background:var(--s1);border:1px solid var(--border);font-size:12px;color:var(--muted2)}}
+.bs-shot-num{{font-family:var(--mono);font-size:11px;color:var(--accent3);font-weight:700;min-width:44px;flex-shrink:0}}
+.bs-thumb-tag{{display:inline-flex;background:rgba(255,34,68,.1);border:1px solid rgba(255,34,68,.3);border-radius:5px;padding:4px 10px;font-size:13px;font-family:var(--mono);font-weight:700;color:#ff2244;letter-spacing:1px}}
+.bs-hashtags{{display:flex;flex-wrap:wrap;gap:6px}}
+.bs-hashtag{{background:var(--s1);border:1px solid var(--border);border-radius:5px;padding:3px 9px;font-size:12px;font-family:var(--mono);color:var(--muted2);cursor:pointer;transition:.1s}}
+.bs-hashtag:hover{{border-color:var(--accent);color:var(--accent)}}
+.bs-brief-insight{{font-size:12px;color:var(--muted2);line-height:1.5;padding:10px 12px;background:var(--s1);border-radius:7px;border:1px solid var(--border)}}
+.bs-copy-btn{{background:var(--s1);border:1px solid var(--border);color:var(--muted);font-size:10px;padding:2px 8px;border-radius:4px;cursor:pointer;flex-shrink:0;transition:.1s}}
+.bs-copy-btn:hover{{color:var(--accent);border-color:var(--accent)}}
+.bs-copy-btn.copied{{color:var(--accent);border-color:rgba(0,232,181,.4);background:rgba(0,232,181,.08)}}
+/* AI Studio tab */
+.bs-studio-wrap{{max-width:680px}}
+.bs-studio-card{{background:var(--s1);border:1px solid var(--border);border-radius:14px;padding:22px;margin-bottom:14px}}
+.bs-studio-head{{font-size:15px;font-weight:700;color:#fff;margin-bottom:3px}}
+.bs-studio-sub{{font-size:12px;color:var(--muted);margin-bottom:18px;line-height:1.5}}
+.bs-mode-row{{display:flex;gap:8px;margin-bottom:18px}}
+.bs-mode-btn{{flex:1;padding:10px 8px;border-radius:8px;border:1px solid var(--border);background:var(--s2);color:var(--muted);font-size:12px;font-weight:600;cursor:pointer;text-align:center;transition:.15s;font-family:var(--sans)}}
+.bs-mode-btn.active{{border-color:var(--accent);background:rgba(0,232,181,.08);color:var(--accent)}}
+.bs-studio-label{{font-size:11px;color:var(--muted);margin-bottom:5px;font-weight:600;letter-spacing:.5px}}
+.bs-studio-input{{width:100%;box-sizing:border-box;background:var(--s2);border:1px solid var(--border);color:#fff;padding:10px 14px;border-radius:8px;font-size:13px;outline:none;margin-bottom:14px;font-family:var(--sans)}}
+.bs-studio-input:focus{{border-color:var(--accent)}}
+.bs-studio-select{{background:var(--s2);border:1px solid var(--border);color:#fff;padding:10px 14px;border-radius:8px;font-size:13px;outline:none;margin-bottom:14px;font-family:var(--sans);width:100%;cursor:pointer}}
+.bs-studio-actions{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
+.bs-studio-btn{{background:linear-gradient(135deg,rgba(0,232,181,.2),rgba(79,142,247,.2));border:1px solid var(--accent);color:var(--accent);font-size:13px;font-weight:700;padding:9px 18px;border-radius:8px;cursor:pointer;transition:.2s;display:inline-flex;align-items:center;gap:7px;font-family:var(--sans)}}
+.bs-studio-btn:hover{{background:linear-gradient(135deg,rgba(0,232,181,.35),rgba(79,142,247,.35))}}
+.bs-studio-btn:disabled{{opacity:.5;cursor:wait}}
+.bs-prompt-btn{{background:var(--s2);border:1px solid var(--border);color:var(--muted);font-size:12px;padding:9px 16px;border-radius:8px;cursor:pointer;transition:.1s;display:inline-flex;align-items:center;gap:6px;font-family:var(--sans)}}
+.bs-prompt-btn:hover{{border-color:var(--accent3);color:var(--accent3)}}
+.bs-studio-output{{background:var(--s2);border:1px solid var(--border);border-radius:10px;padding:18px;margin-top:16px;display:none}}
+.bs-studio-out-head{{font-size:12px;color:var(--muted);margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;gap:8px}}
+.bs-studio-out-loading{{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:13px}}
+/* badges */
+.sat-badge{{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:12px;font-size:11px;font-weight:600}}
 .sat-fresh{{background:rgba(0,232,181,.1);color:var(--accent);border:1px solid rgba(0,232,181,.3)}}
 .sat-part{{background:rgba(245,183,0,.1);color:var(--accent3);border:1px solid rgba(245,183,0,.3)}}
 .sat-sat{{background:rgba(255,55,95,.1);color:var(--accent2);border:1px solid rgba(255,55,95,.3)}}
-.fmt-badge{{display:inline-block;padding:2px 9px;border-radius:4px;font-family:var(--mono);font-size:10px;background:var(--s2);border:1px solid var(--border);color:var(--muted2);margin-left:8px}}
-.bs-open{{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:7px;background:#ff0000;color:#fff;font-size:13px;font-weight:600;border:none;cursor:pointer;margin-top:10px;text-decoration:none}}
+.fmt-badge{{display:inline-block;padding:2px 9px;border-radius:4px;font-family:var(--mono);font-size:10px;background:var(--s2);border:1px solid var(--border);color:var(--muted2)}}
+/* stats bar + filters */
+.bs-stats{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}}
+.bs-stat{{background:var(--s2);border:1px solid var(--border);border-radius:8px;padding:10px 16px;text-align:center;min-width:70px}}
+.bs-stat-v{{font-family:var(--mono);font-size:18px;font-weight:700;color:#fff}}
+.bs-stat-l{{font-size:10px;color:var(--muted);margin-top:2px;text-transform:uppercase;letter-spacing:.5px}}
+.bs-tab{{background:none;border:none;border-bottom:2px solid transparent;color:var(--muted);font-size:13px;font-weight:600;padding:8px 16px;cursor:pointer;transition:.15s;margin-bottom:-1px}}
+.bs-tab.active{{color:var(--accent);border-bottom-color:var(--accent)}}
+.bs-search{{background:var(--s2);border:1px solid var(--border);color:var(--text);padding:8px 14px;border-radius:8px;font-size:13px;outline:none;width:220px;transition:.15s}}
+.bs-search:focus{{border-color:var(--accent)}}
+/* gap finder */
+.gap-card{{background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:16px 18px;margin-bottom:10px}}
+.gap-untapped{{border-left:3px solid var(--accent)}}
+.gap-covered{{border-left:3px solid var(--border2);opacity:.7}}
+/* progress (used elsewhere) */
+.progress-row{{display:flex;align-items:center;gap:10px;margin-bottom:7px}}
+.progress-lbl{{font-size:11px;color:var(--muted2);min-width:78px}}
+.progress-bar{{flex:1;height:5px;background:var(--s2);border-radius:3px;overflow:hidden}}
+.progress-fill{{height:100%;border-radius:3px;transition:width .3s}}
+.progress-val{{font-family:var(--mono);font-size:11px;min-width:38px;text-align:right}}
 
 /* HOF */
 .hof-card{{background:var(--s1);border:1px solid var(--border);border-radius:9px;padding:14px 16px;margin-bottom:8px;display:grid;grid-template-columns:auto 1fr auto;gap:0 14px;align-items:center}}
 .hof-score{{font-family:var(--mono);font-size:20px;font-weight:700;color:var(--accent2);white-space:nowrap}}
-.hof-ch{{font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:1px;text-transform:uppercase;margin-bottom:3px}}
+.hof-ch{{font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:1px;text-transform:uppercase;margin-bottom:3px;display:flex;align-items:center;gap:7px}}
 .hof-t{{font-size:14px;font-weight:500;color:#fff}}
 .hof-right{{text-align:right}}
 .hof-views{{font-family:var(--mono);font-size:14px;color:#fff;margin-bottom:4px}}
@@ -521,7 +739,7 @@ input:focus{{border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,232,181,.08)
 .tr-ch-pills{{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}}
 .tr-ch-pill{{font-size:11px;padding:3px 9px;border-radius:20px;background:var(--s2);border:1px solid var(--border);color:var(--muted2)}}
 .tr-entry{{display:flex;align-items:center;gap:10px;padding:7px 10px;background:var(--s2);border-radius:6px;margin-bottom:5px}}
-.tr-entry-ch{{font-size:11px;color:var(--accent);min-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.tr-entry-ch{{font-size:11px;color:var(--accent);min-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center;gap:6px}}
 .tr-entry-t{{font-size:12px;color:var(--text);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 .tr-entry-v{{font-family:var(--mono);font-size:11px;color:#fff;margin-left:auto}}
 
@@ -556,7 +774,7 @@ input:focus{{border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,232,181,.08)
 .bm-trail{{color:var(--accent2)}}
 .bm-big{{color:#ff2244;font-weight:700}}
 .bm-bar-wrap{{display:flex;align-items:center;gap:10px;margin-bottom:6px}}
-.bm-bar-label{{font-size:12px;color:var(--text);min-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.bm-bar-label{{font-size:12px;color:var(--text);min-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center;gap:7px}}
 .bm-bar-track{{flex:1;height:10px;background:var(--s2);border-radius:5px;overflow:hidden;position:relative}}
 .bm-bar-fill{{height:100%;border-radius:5px;position:absolute;left:0;top:0}}
 .bm-bar-val{{font-family:var(--mono);font-size:11px;color:var(--muted2);min-width:60px;text-align:right}}
@@ -571,7 +789,7 @@ input:focus{{border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,232,181,.08)
 /* ── VELOCITY curves ── */
 .vel-card{{background:var(--s1);border:1px solid var(--border);border-radius:10px;padding:18px;margin-bottom:10px}}
 .vel-header{{display:flex;align-items:center;gap:12px;margin-bottom:10px}}
-.vel-ch{{font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:2px;text-transform:uppercase}}
+.vel-ch{{font-family:var(--mono);font-size:10px;color:var(--accent);letter-spacing:2px;text-transform:uppercase;display:flex;align-items:center;gap:7px}}
 .vel-title{{font-size:15px;font-weight:600;color:#fff}}
 .vel-meta{{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:12px}}
 .vel-m{{font-family:var(--mono);font-size:12px;color:var(--muted2)}}
@@ -664,7 +882,7 @@ input:focus{{border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,232,181,.08)
     <div class="kpi-mini"><div class="kpi-v r" id="kS">{spike_count}</div><div class="kpi-l">Spikes</div></div>
     <div class="kpi-mini"><div class="kpi-v y" id="kF">{fresh_count}</div><div class="kpi-l">Fresh</div></div>
   </div>
-  <div class="nav-meta">{scan_time}<br>{html.escape(profile_label)}</div>
+  <div class="nav-meta">Last scan: {last_scan_str}<br>{html.escape(profile_label)}</div>
 </nav>
 
 <!-- MAIN CONTENT -->
@@ -696,7 +914,51 @@ input:focus{{border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,232,181,.08)
 
 <!-- ════════════════ PAGE: BRAINSTORM ════════════════ -->
 <div class="page" id="page-brainstorm">
-  <div class="apage" id="bsContent"></div>
+  <div class="apage">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:16px">
+      <div class="apage-title" style="margin:0">🧠 Brainstorm</div>
+      <div style="display:flex;gap:7px;flex-wrap:wrap;align-items:center" id="bsFiltersRow">
+        <input type="text" class="bs-search" id="bsSearch" placeholder="Search ideas…" oninput="renderBrainstorm()">
+        <select id="bsFmtFilter" onchange="renderBrainstorm()" style="background:var(--s2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:7px;font-size:12px;outline:none">
+          <option value="all">All Formats</option>
+          <option value="POV">POV</option>
+          <option value="Ranking">Ranking</option>
+          <option value="Tutorial">Tutorial</option>
+          <option value="Reveal">Reveal</option>
+          <option value="Comparison">Comparison</option>
+          <option value="Challenge">Challenge</option>
+          <option value="Reaction">Reaction</option>
+          <option value="Other">Other</option>
+        </select>
+        <select id="bsDaysFilter" onchange="renderBrainstorm()" style="background:var(--s2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:7px;font-size:12px;outline:none">
+          <option value="9999">Any age</option>
+          <option value="7">Last 7d</option>
+          <option value="30">Last 30d</option>
+          <option value="90">Last 90d</option>
+        </select>
+        <select id="bsSortFilter" onchange="renderBrainstorm()" style="background:var(--s2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:7px;font-size:12px;outline:none">
+          <option value="opportunity">🎯 Opportunity</option>
+          <option value="score">🔥 Viral Score</option>
+          <option value="views">👀 Views</option>
+          <option value="vpd">📈 VPD</option>
+          <option value="saturation_asc">🟢 Least Saturated</option>
+          <option value="pinned">📌 Pinned First</option>
+        </select>
+        <button id="bsHideDoneBtn" onclick="toggleHideDone()" class="bs-btn">Hide Done</button>
+        <button onclick="bsDoneIds.clear();bsPinnedIds.clear();renderBrainstorm()" class="bs-btn">Reset All</button>
+        <input type="password" id="bsApiKeyInput" placeholder="🔑 Anthropic key" style="background:var(--s2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:7px;font-size:12px;outline:none;width:185px" oninput="localStorage.setItem('bs_api_key',this.value)">
+      </div>
+    </div>
+    <div id="bsStatsBar"></div>
+    <div style="display:flex;gap:0;margin-bottom:18px;border-bottom:1px solid var(--border)">
+      <button class="bs-tab active" data-tab="cards" onclick="setBsTab('cards')">📋 Ideas</button>
+      <button class="bs-tab" data-tab="studio" onclick="setBsTab('studio')">🤖 AI Studio</button>
+      <button class="bs-tab" data-tab="gaps" onclick="setBsTab('gaps')">🕳 Gap Finder</button>
+    </div>
+    <div id="bsCardsView"></div>
+    <div id="bsStudioView" style="display:none"></div>
+    <div id="bsGapsView" style="display:none"></div>
+  </div>
 </div>
 
 <!-- ════════════════ PAGE: TREND RADAR ════════════════ -->
@@ -821,6 +1083,10 @@ const VELOCITY    = {velocity_js};
 const WORDPOWER   = {wordpower_js};
 const WORD_GLOBAL = {wp_global_js};
 const REMAKE_ROI  = {remake_roi_js};
+const PFP_MAP     = {pfp_js};
+// Build channel name → pfp URL map for sidebar
+const CH_PFP = {{}};
+VIDEOS.forEach(v => {{ if (v.channelId && PFP_MAP[v.channelId]) CH_PFP[v.channel] = PFP_MAP[v.channelId]; }});
 const DAYS        = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 
 // ── STATE ──
@@ -978,8 +1244,13 @@ function renderVideos() {{
   const maxV = chArr[0]?.[1].views||1
   document.getElementById("chSB").innerHTML = chArr.map(([ch,s]) => {{
     const pct = Math.round(s.views/maxV*100)
+    const pfpUrl = CH_PFP[ch]
+    const pfpHtml = pfpUrl
+      ? `<img class="ch-pfp" src="${{pfpUrl}}" alt="" loading="lazy" onerror="this.style.display='none';this.nextSibling.style.display='flex'"><div class="ch-pfp-placeholder" style="display:none">${{(ch||"?")[0].toUpperCase()}}</div>`
+      : `<div class="ch-pfp-placeholder">${{(ch||"?")[0].toUpperCase()}}</div>`
     return `<div class="ch-item ${{activeChannel===ch?"sel":""}}" data-ch="${{ch.replace(/"/g,"&quot;")}}">
-      <div><div class="ch-name ${{s.is_mine?"mine":""}}">${{ch}}</div>
+      ${{pfpHtml}}
+      <div style="flex:1;min-width:0"><div class="ch-name ${{s.is_mine?"mine":""}}">${{ch}}</div>
       <div class="ch-bar" style="width:${{pct}}%"></div></div>
       <div class="ch-cnt">${{s.count}}</div>
     </div>`
@@ -1003,7 +1274,15 @@ function renderVideos() {{
       `<span class="badge b-hl ${{BCLASS[hp]}}">${{hp.toUpperCase()}}</span>`,
     ].filter(Boolean).join(" ")
     return `<div class="card ${{HCLASS[hp]}}" data-idx="${{i}}">
-      <div class="c-rank">#${{i+1}}</div>
+      <div class="c-rank-wrap">
+        ${{PFP_MAP[r.channelId]
+          ? `<img class="c-pfp" src="${{PFP_MAP[r.channelId]}}" alt="" loading="lazy" onerror="this.style.display='none';this.nextSibling.style.display='flex'">`
+          : ``}}
+        ${{PFP_MAP[r.channelId]
+          ? `<div class="c-pfp-placeholder" style="display:none">${{(r.channel||"?")[0].toUpperCase()}}</div>`
+          : `<div class="c-pfp-placeholder">${{(r.channel||"?")[0].toUpperCase()}}</div>`}}
+        <div class="c-rank">#${{i+1}}</div>
+      </div>
       <div>
         <div class="c-top"><span class="c-ch ${{r.is_mine?"mine":""}}">${{r.channel}}</span>${{badges}}</div>
         <div class="c-title">${{r.title}}</div>
@@ -1034,7 +1313,7 @@ function openModal(r) {{
   document.getElementById("modalWrap").className="overlay"
   document.getElementById("modalWrap").innerHTML = `
     <div class="modal">
-      <div class="modal-ch">${{r.channel}}</div>
+      <div class="modal-ch">${{CH_PFP[r.channel]?`<img class="ch-pfp" src="${{CH_PFP[r.channel]}}" alt="" style="width:20px;height:20px" onerror="this.style.display='none'">`:""}}<span>${{r.channel}}</span></div>
       <div class="modal-t">${{r.title}}</div>
       <div class="sg">
         ${{sb("Views",fmt(r.views))}}${{sb("Hype",`<span style="color:${{hcol[hp]}}">${{r.score.toFixed(1)}}×</span>`)}}${{sb("Views/Day",fmt(r.vpd))}}
@@ -1054,49 +1333,690 @@ function openModal(r) {{
 document.addEventListener("keydown",e=>{{if(e.key==="Escape")document.getElementById("modalWrap").style.display="none"}})
 document.addEventListener("click",e=>{{if(e.target.id==="modalWrap")e.target.style.display="none"}})
 
-// ── BRAINSTORM ──
+// ══════════════════════════════════════════════════════════════
+// ★ BRAINSTORM v5 — AI-powered content generation engine
+// ══════════════════════════════════════════════════════════════
+let bsDoneIds    = new Set()
+let bsPinnedIds  = new Set()
+let bsHideDone   = false
+let bsActiveTab  = "cards"
+let bsBriefCache = {{}}   // id -> parsed brief object
+let bsStudioMode = "remake"
+
+function fmt(n) {{
+  if (n >= 1e9) return (n/1e9).toFixed(1)+"B"
+  if (n >= 1e6) return (n/1e6).toFixed(1)+"M"
+  if (n >= 1e3) return (n/1e3).toFixed(1)+"k"
+  return String(n)
+}}
+
+function copyText(text, btn) {{
+  navigator.clipboard.writeText(text).then(() => {{
+    const orig = btn.textContent
+    btn.textContent = "✓ Copied!"
+    btn.classList.add("copied")
+    setTimeout(() => {{ btn.textContent = orig; btn.classList.remove("copied") }}, 1600)
+  }})
+}}
+
+// ─── TAB + FILTER CONTROLS ───────────────────────────────────
+
+function setBsTab(tab) {{
+  bsActiveTab = tab
+  document.querySelectorAll(".bs-tab").forEach(t => t.classList.toggle("active", t.dataset.tab === tab))
+  document.getElementById("bsCardsView").style.display   = tab === "cards"  ? "block" : "none"
+  document.getElementById("bsStudioView").style.display  = tab === "studio" ? "block" : "none"
+  document.getElementById("bsGapsView").style.display    = tab === "gaps"   ? "block" : "none"
+  const filtersRow = document.getElementById("bsFiltersRow")
+  if (filtersRow) filtersRow.style.display = tab === "cards" ? "flex" : "none"
+  if (tab === "gaps")   renderBsGaps()
+  if (tab === "studio") renderBsStudio()
+}}
+
+function toggleHideDone() {{
+  bsHideDone = !bsHideDone
+  document.getElementById("bsHideDoneBtn")?.classList.toggle("active", bsHideDone)
+  renderBrainstorm()
+}}
+
+function togglePin(id) {{ bsPinnedIds.has(id) ? bsPinnedIds.delete(id) : bsPinnedIds.add(id); renderBrainstorm() }}
+function toggleBsDone(id) {{ bsDoneIds.has(id) ? bsDoneIds.delete(id) : bsDoneIds.add(id); renderBrainstorm() }}
+
+// ─── STATS BAR ───────────────────────────────────────────────
+
+function renderBsStats(cards) {{
+  const hot    = cards.filter(c => c.remake_score >= 70).length
+  const good   = cards.filter(c => c.remake_score >= 45 && c.remake_score < 70).length
+  const fresh  = cards.filter(c => c.saturation <= 1).length
+  const pinned = bsPinnedIds.size
+  const done   = bsDoneIds.size
+  document.getElementById("bsStatsBar").innerHTML = `<div class="bs-stats">
+    <div class="bs-stat"><div class="bs-stat-v" style="color:#ff2244">${{hot}}</div><div class="bs-stat-l">🔥 Hot</div></div>
+    <div class="bs-stat"><div class="bs-stat-v" style="color:var(--accent3)">${{good}}</div><div class="bs-stat-l">⚡ Good</div></div>
+    <div class="bs-stat"><div class="bs-stat-v" style="color:var(--accent)">${{fresh}}</div><div class="bs-stat-l">🟢 Fresh</div></div>
+    <div class="bs-stat"><div class="bs-stat-v">${{cards.length}}</div><div class="bs-stat-l">Total</div></div>
+    ${{pinned ? `<div class="bs-stat"><div class="bs-stat-v" style="color:var(--accent3)">${{pinned}}</div><div class="bs-stat-l">📌 Pinned</div></div>` : ""}}
+    ${{done   ? `<div class="bs-stat"><div class="bs-stat-v" style="color:var(--muted)">${{done}}</div><div class="bs-stat-l">✓ Done</div></div>` : ""}}
+  </div>`
+}}
+
+// ─── MAIN CARD RENDERER ──────────────────────────────────────
+
 function renderBrainstorm() {{
-  if (!BRAINSTORM.length) {{ document.getElementById("bsContent").innerHTML='<div class="empty"><div class="empty-icon">🧠</div><p>No data</p></div>'; return }}
-  let h = `<div class="apage-title">Top 20 Videos to Remake — Composite Score</div>`
-  BRAINSTORM.forEach((r,i) => {{
-    const sc = r.is_spike ? `<span class="badge b-sp" style="margin-left:8px">⚡SPIKE</span>` : ""
-    const mc = r.is_mine  ? `<span class="badge b-me" style="margin-left:8px">★ YOU</span>` : ""
-    const satCls = r.saturation>=5?"sat-sat":r.saturation>=2?"sat-part":"sat-fresh"
-    const satLbl = r.saturation>=5?`🔴 Saturated (${{r.saturation}} channels)`:r.saturation>=2?`🟡 Partial (${{r.saturation}} channels)`:`🟢 Fresh (only ${{r.saturation}} others)`
-    const sPct   = r.success
-    const sColor = sPct>=75?"var(--accent)":sPct>=55?"var(--accent3)":"var(--accent2)"
-    h += `<div class="bs-card">
-      <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:10px">
-        <div class="bs-rank">#${{i+1}}</div>
-        <div class="fmt-badge">${{r.format}}</div>${{sc}}${{mc}}
+  const allCards = BRAINSTORM.cards || []
+  renderBsStats(allCards)
+  if (!allCards.length) {{
+    document.getElementById("bsCardsView").innerHTML = '<div class="empty"><div class="empty-icon">🧠</div><p>No data — run a scan first</p></div>'
+    return
+  }}
+
+  const q          = document.getElementById("bsSearch")?.value.toLowerCase() || ""
+  const fmtFilter  = document.getElementById("bsFmtFilter")?.value  || "all"
+  const daysFilter = parseInt(document.getElementById("bsDaysFilter")?.value) || 9999
+  const sortFilter = document.getElementById("bsSortFilter")?.value  || "opportunity"
+
+  let shown = allCards.filter(r => {{
+    if (bsHideDone && bsDoneIds.has(r.id)) return false
+    if (q && !r.title.toLowerCase().includes(q) && !r.channel.toLowerCase().includes(q)) return false
+    if (fmtFilter !== "all" && r.format !== fmtFilter) return false
+    if (daysFilter < 9999 && r.age_days > daysFilter) return false
+    return true
+  }})
+
+  if      (sortFilter === "score")          shown.sort((a,b) => b.score - a.score)
+  else if (sortFilter === "views")          shown.sort((a,b) => b.views - a.views)
+  else if (sortFilter === "vpd")            shown.sort((a,b) => b.vpd - a.vpd)
+  else if (sortFilter === "saturation_asc") shown.sort((a,b) => a.saturation - b.saturation)
+  else if (sortFilter === "pinned")         shown.sort((a,b) => (bsPinnedIds.has(b.id)?1:0)-(bsPinnedIds.has(a.id)?1:0))
+  else                                      shown.sort((a,b) => b.opportunity - a.opportunity)
+
+  // Pinned always float
+  shown.sort((a,b) => (bsPinnedIds.has(b.id) ? 1 : 0) - (bsPinnedIds.has(a.id) ? 1 : 0))
+
+  let h = ""
+  shown.forEach((r, i) => {{
+    const rs       = r.remake_score ?? r.opportunity
+    const scoreCls = rs >= 70 ? "bs-score-hot" : rs >= 45 ? "bs-score-good" : "bs-score-ok"
+    const satCls   = r.saturation >= 5 ? "sat-sat" : r.saturation >= 2 ? "sat-part" : "sat-fresh"
+    const satLbl   = r.saturation >= 5 ? `🔴 Saturated` : r.saturation >= 2 ? `🟡 Partial` : `🟢 Fresh`
+    const sPct     = r.success
+    const sColor   = sPct >= 75 ? "var(--accent)" : sPct >= 55 ? "var(--accent3)" : "var(--accent2)"
+    const isDone   = bsDoneIds.has(r.id)
+    const isPinned = bsPinnedIds.has(r.id)
+    const thumb    = `https://i.ytimg.com/vi/${{r.id}}/mqdefault.jpg`
+    const briefOpen = bsBriefCache[r.id] ? "block" : "none"
+    const hasBrief  = !!bsBriefCache[r.id]
+
+    // Escape helpers
+    const esc = s => (s||"").replace(/'/g,"&#39;").replace(/`/g,"&#96;")
+
+    h += `<div class="bs-card${{isDone?" bs-done":""}}${{isPinned?" bs-pinned":""}}" id="bscard-${{r.id}}">
+      <!-- HEADER -->
+      <div class="bs-card-top">
+        <div class="bs-card-header">
+          <div class="bs-score ${{scoreCls}}">${{rs}}</div>
+          <div class="bs-hdr-right">
+            <div class="bs-fmt-row">
+              <span class="bs-rank">#${{i+1}}</span>
+              <span class="fmt-badge">${{r.format}}</span>
+              ${{r.is_spike ? `<span style="background:rgba(255,34,68,.1);color:#ff2244;border:1px solid rgba(255,34,68,.3);border-radius:10px;padding:1px 7px;font-size:10px;font-weight:700">⚡ SPIKE</span>` : ""}}
+              ${{isPinned ? `<span style="color:var(--accent3);font-size:12px">📌</span>` : ""}}
+            </div>
+            <div class="bs-channel">
+              ${{CH_PFP[r.channel] ? `<img class="ch-pfp" src="${{CH_PFP[r.channel]}}" alt="" style="width:14px;height:14px" onerror="this.style.display='none'">` : ""}}
+              <span>${{r.channel}}</span>
+            </div>
+          </div>
+        </div>
+        <!-- BODY: thumb + info -->
+        <div class="bs-body-row">
+          <img class="bs-thumb" src="${{thumb}}" loading="lazy" onerror="this.style.display='none'" alt="">
+          <div class="bs-body-info">
+            <div class="bs-title">${{r.title}}</div>
+            <div class="bs-meta">
+              <span class="bs-m w">👀 ${{fmt(r.views)}}</span>
+              <span class="bs-m g">${{r.score.toFixed(1)}}× hype</span>
+              <span class="bs-m">📈 ${{fmt(r.vpd)}}/d</span>
+              <span class="bs-m b">❤ ${{r.lr.toFixed(1)}}%</span>
+              <span class="bs-m">${{r.age}}</span>
+            </div>
+          </div>
+        </div>
       </div>
-      <div class="bs-channel">${{r.channel}}</div>
-      <div class="bs-title">${{r.title}}</div>
-      <div class="bs-meta">
-        <span class="bs-m w">👀 ${{fmt(r.views)}}</span>
-        <span class="bs-m g">${{r.score.toFixed(1)}}×</span>
-        <span class="bs-m">📈 ${{fmt(r.vpd)}}/d</span>
-        <span class="bs-m b">❤ ${{r.lr.toFixed(1)}}%</span>
-        <span class="bs-m">${{r.age}}</span>
+
+      <!-- SAT + SUCCESS ROW -->
+      <div class="bs-sat-row">
+        <span class="sat-badge ${{satCls}}">${{satLbl}} (${{r.saturation}} similar)</span>
+        <div class="bs-succ-bar">
+          <span style="font-size:10px;color:var(--muted2)">Success likelihood</span>
+          <div style="width:80px;height:4px;background:var(--s2);border-radius:3px;overflow:hidden;margin:0 4px">
+            <div style="width:${{sPct}}%;height:100%;background:${{sColor}};border-radius:3px"></div>
+          </div>
+          <span style="font-family:var(--mono);font-size:11px;color:${{sColor}}">${{sPct}}%</span>
+        </div>
       </div>
-      <div class="sat-badge ${{satCls}}">${{satLbl}}</div>
-      <div class="progress-row">
-        <div class="progress-lbl">Success est.</div>
-        <div class="progress-bar"><div class="progress-fill" style="width:${{sPct}}%;background:${{sColor}}"></div></div>
-        <div class="progress-val" style="color:${{sColor}};font-family:var(--mono);font-size:12px">${{sPct}}%</div>
+
+      ${{r.suggested_title ? `
+      <!-- SUGGESTED TITLE STRIP -->
+      <div class="bs-sug-strip">
+        <span class="bs-sug-label">💡 Use:</span>
+        <span class="bs-sug-text">${{r.suggested_title}}</span>
+        <button class="bs-copy-btn" onclick="copyText('${{esc(r.suggested_title)}}',this)">Copy</button>
+      </div>` : ""}}
+
+      <!-- ACTION BAR -->
+      <div class="bs-actions">
+        <a class="bs-open" href="https://youtube.com/shorts/${{r.id}}" target="_blank">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>Watch
+        </a>
+        <button class="bs-btn-gen" id="gen-btn-${{r.id}}" onclick="toggleBrief('${{r.id}}',this)" ${{hasBrief?"":""}}>
+          ${{hasBrief ? "📋 Brief ▾" : "🎬 Generate Brief"}}
+        </button>
+        <button class="bs-prompt-btn" onclick="copyMegaPrompt(${{JSON.stringify(r).replace(/'/g,'&#39;')}})">📋 Copy Prompt</button>
+        <button class="bs-btn${{isPinned?" pin-active":""}}" onclick="togglePin('${{r.id}}')">${{isPinned?"📌":"📌 Pin"}}</button>
+        <button class="bs-btn${{isDone?" active":""}}" onclick="toggleBsDone('${{r.id}}')" style="margin-left:auto">${{isDone?"✓ Done":"Mark Done"}}</button>
       </div>
-      <div class="progress-row">
-        <div class="progress-lbl">Repro score</div>
-        <div class="progress-bar"><div class="progress-fill" style="width:${{r.repro*10}}%;background:var(--blue)"></div></div>
-        <div class="progress-val" style="color:var(--blue);font-family:var(--mono);font-size:12px">${{r.repro}}/10</div>
+
+      <!-- BRIEF PANEL (hidden until generated) -->
+      <div class="bs-brief" id="brief-${{r.id}}" style="display:${{briefOpen}}">
+        ${{hasBrief ? renderBriefHtml(r.id) : ""}}
       </div>
-      <a class="bs-open" href="https://youtube.com/shorts/${{r.id}}" target="_blank">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>Open Short
-      </a>
     </div>`
   }})
-  document.getElementById("bsContent").innerHTML = h
+
+  if (!shown.length) h = `<div class="empty"><div class="empty-icon">🔍</div><p>No ideas match these filters</p></div>`
+  document.getElementById("bsCardsView").innerHTML = h
 }}
+
+// ─── BRIEF GENERATION ────────────────────────────────────────
+
+function toggleBrief(id, btn) {{
+  const panel = document.getElementById("brief-" + id)
+  if (!panel) return
+  const isOpen = panel.style.display !== "none"
+
+  if (isOpen) {{
+    panel.style.display = "none"
+    btn.textContent = bsBriefCache[id] ? "📋 Brief ▾" : "🎬 Generate Brief"
+    return
+  }}
+
+  panel.style.display = "block"
+  if (bsBriefCache[id]) {{
+    panel.innerHTML = renderBriefHtml(id)
+    btn.textContent = "📋 Hide Brief"
+    return
+  }}
+
+  // Find card data
+  const r = (BRAINSTORM.cards || []).find(c => c.id === id)
+  if (!r) return
+  btn.textContent = "⏳ Generating…"
+  btn.disabled = true
+
+  panel.innerHTML = `<div class="bs-brief-loading"><div class="bs-brief-spin"></div><span>Claude is cooking your full production brief…</span></div>`
+
+  const prompt = buildBriefPrompt(r)
+  callClaudeAPI(prompt, 900).then(text => {{
+    const brief = parseBriefJSON(text)
+    bsBriefCache[id] = brief
+    panel.innerHTML = renderBriefHtml(id)
+    btn.textContent = "📋 Hide Brief"
+    btn.disabled = false
+  }}).catch(err => {{
+    panel.innerHTML = `<div style="color:var(--accent2);font-size:13px;padding:8px 0">⚠ Generation failed: ${{err.message}}. Try the 📋 Copy Prompt button to use a free AI instead.</div>`
+    btn.textContent = "🎬 Generate Brief"
+    btn.disabled = false
+  }})
+}}
+
+function buildBriefPrompt(r) {{
+  return `You are an elite YouTube Shorts strategist. A competitor video went massively viral.
+
+Title: "${{r.title}}"
+Channel: ${{r.channel}}
+Format: ${{r.format}}
+Views: ${{fmt(r.views)}} (${{r.score.toFixed(1)}}× their channel average — this is a banger)
+Views/day right now: ${{fmt(r.vpd)}}
+Like ratio: ${{r.lr.toFixed(1)}}%
+Age: ${{r.age}}
+
+Generate a COMPLETE production brief to make an even better Short on this topic.
+Return ONLY a valid JSON object, no markdown, no explanation, nothing else:
+
+{{
+  "titles": [
+    "option 1: most click-baity version, under 55 chars",
+    "option 2: curiosity-gap angle",
+    "option 3: controversy or debate angle",
+    "option 4: personal story or POV angle",
+    "option 5: bold statement angle"
+  ],
+  "hook": "Exact words to say out loud in seconds 0-3. Be specific and punchy. Start with action, not context.",
+  "shots": [
+    "Shot 1 (0-3s): exactly what to film and say",
+    "Shot 2 (3-8s): what happens here",
+    "Shot 3 (8-16s): main content beat",
+    "Shot 4 (16-24s): escalation or proof",
+    "Shot 5 (24-30s): ending, punchline, or CTA"
+  ],
+  "thumbnail": "3-5 WORDS IN CAPS for the thumbnail text overlay",
+  "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"],
+  "angle": "Your unique twist that makes YOUR version better than the original — one specific sentence",
+  "why_viral": "One sentence on exactly why this format got ${{fmt(r.views)}} views"
+}}`
+}}
+
+async function callClaudeAPI(prompt, maxTokens) {{
+  const key = (document.getElementById("bsApiKeyInput")?.value || localStorage.getItem("bs_api_key") || "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").trim()
+ if (!key) {{ alert("Paste your Groq API key in the 🔑 field above. Get one free at console.groq.com"); throw new Error("No API key") }}
+  const resp = await fetch("https://api.groq.com/openai/v1/chat/completions", {{
+    method: "POST",
+    headers: {{
+      "Content-Type": "application/json",
+      "Authorization": "Bearer " + key
+    }},
+    body: JSON.stringify({{
+      model: "llama-3.3-70b-versatile",
+      max_tokens: maxTokens || 1000,
+      messages: [{{role: "user", content: prompt}}]
+    }})
+  }})
+  if (!resp.ok) {{ const e = await resp.json().catch(()=>{{}}); throw new Error((e?.error?.message)||"API error "+resp.status) }}
+  const data = await resp.json()
+  return data.choices?.[0]?.message?.content?.trim()
+}}
+
+function parseBriefJSON(text) {{
+  try {{
+    const clean = text.replace(/```json|```/g, "").trim()
+    return JSON.parse(clean)
+  }} catch(e) {{
+    // fallback: try to extract JSON object
+    const m = text.match(/\{{[\s\S]*\}}/)
+    if (m) {{ try {{ return JSON.parse(m[0]) }} catch(e2) {{}} }}
+    return null
+  }}
+}}
+
+function renderBriefHtml(id) {{
+  const b = bsBriefCache[id]
+  if (!b) return ""
+  const esc = s => (s||"").replace(/'/g,"&#39;")
+
+  const titlesHtml = Array.isArray(b.titles) ? b.titles.map((t,i) => `
+    <div class="bs-title-opt">
+      <span class="bs-title-opt-num">${{i+1}}</span>
+      <span class="bs-title-opt-text">${{t}}</span>
+      <button class="bs-copy-btn" onclick="copyText('${{esc(t)}}',this)">Copy</button>
+    </div>`).join("") : ""
+
+  const shotsHtml = Array.isArray(b.shots) ? b.shots.map((s,i) => `
+    <div class="bs-shot-item">
+      <span class="bs-shot-num">Shot ${{i+1}}</span>
+      <span>${{s}}</span>
+    </div>`).join("") : ""
+
+  const hashtagStr = Array.isArray(b.hashtags) ? b.hashtags.join(" ") : (b.hashtags || "")
+  const hashtagsHtml = Array.isArray(b.hashtags) ? b.hashtags.map(h =>
+    `<span class="bs-hashtag" onclick="copyText('${{h}}',this)">${{h}}</span>`).join("") : ""
+
+  return `
+    <div style="font-size:10px;font-family:var(--mono);color:var(--accent);letter-spacing:2px;text-transform:uppercase;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between">
+      <span>✦ FULL PRODUCTION BRIEF</span>
+      <button class="bs-copy-btn" onclick="copyEntireBrief('${{id}}')">Copy All</button>
+    </div>
+
+    ${{titlesHtml ? `<div class="bs-brief-section">
+      <div class="bs-brief-label">✏️ TITLE OPTIONS — pick the best one</div>
+      ${{titlesHtml}}
+    </div>` : ""}}
+
+    ${{b.hook ? `<div class="bs-brief-section">
+      <div class="bs-brief-label">🎬 3-SECOND HOOK — say these exact words</div>
+      <div class="bs-hook-box">${{b.hook}}</div>
+    </div>` : ""}}
+
+    ${{shotsHtml ? `<div class="bs-brief-section">
+      <div class="bs-brief-label">🎥 SHOT BREAKDOWN</div>
+      <div class="bs-shot-list">${{shotsHtml}}</div>
+    </div>` : ""}}
+
+    ${{b.thumbnail ? `<div class="bs-brief-section">
+      <div class="bs-brief-label">🖼 THUMBNAIL TEXT</div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span class="bs-thumb-tag">${{b.thumbnail}}</span>
+        <button class="bs-copy-btn" onclick="copyText('${{esc(b.thumbnail)}}',this)">Copy</button>
+      </div>
+    </div>` : ""}}
+
+    ${{hashtagsHtml ? `<div class="bs-brief-section">
+      <div class="bs-brief-label">🏷 HASHTAGS <span style="font-size:10px;text-transform:none;letter-spacing:0;color:var(--muted);font-family:var(--sans)">(click to copy individual)</span></div>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <div class="bs-hashtags">${{hashtagsHtml}}</div>
+        <button class="bs-copy-btn" onclick="copyText('${{esc(hashtagStr)}}',this)">Copy All</button>
+      </div>
+    </div>` : ""}}
+
+    ${{(b.angle || b.why_viral) ? `<div class="bs-brief-section" style="margin-bottom:0">
+      ${{b.angle ? `<div class="bs-brief-label">🎯 YOUR UNIQUE ANGLE</div>
+      <div class="bs-brief-insight">${{b.angle}}</div>` : ""}}
+      ${{b.why_viral ? `<div class="bs-brief-label" style="margin-top:10px">💡 WHY IT WENT VIRAL</div>
+      <div class="bs-brief-insight" style="color:var(--accent3)">${{b.why_viral}}</div>` : ""}}
+    </div>` : ""}}`
+}}
+
+function copyEntireBrief(id) {{
+  const b = bsBriefCache[id]
+  if (!b) return
+  const r = (BRAINSTORM.cards || []).find(c => c.id === id) || {{}}
+  let out = `PRODUCTION BRIEF — ${{r.title || ""}}\n${{r.channel || ""}} · ${{fmt(r.views||0)}} views · ${{r.score||0}}× hype\n\n`
+  if (b.titles?.length) out += `TITLE OPTIONS:\n${{b.titles.map((t,i)=>`${{i+1}}. ${{t}}`).join("\\n")}}\n\n`
+  if (b.hook) out += `3-SEC HOOK:\n${{b.hook}}\n\n`
+  if (b.shots?.length) out += `SHOT BREAKDOWN:\n${{b.shots.map((s,i)=>`Shot ${{i+1}}: ${{s}}`).join("\\n")}}\n\n`
+  if (b.thumbnail) out += `THUMBNAIL TEXT: ${{b.thumbnail}}\n\n`
+  if (b.hashtags?.length) out += `HASHTAGS: ${{b.hashtags.join(" ")}}\n\n`
+  if (b.angle) out += `YOUR ANGLE: ${{b.angle}}\n`
+  if (b.why_viral) out += `WHY VIRAL: ${{b.why_viral}}\n`
+  navigator.clipboard.writeText(out)
+  alert("✓ Full brief copied to clipboard!")
+}}
+
+// ─── MEGA PROMPT (paste into any free AI) ────────────────────
+
+function copyMegaPrompt(r) {{
+  const prompt = `You are an elite YouTube Shorts strategist. I'm tracking my competitors and this video just went viral:
+
+Title: "${{r.title}}"
+Channel: ${{r.channel}}
+Format: ${{r.format}}
+Views: ${{fmt(r.views)}} (${{r.score?.toFixed ? r.score.toFixed(1) : r.score}}× channel average)
+Views/day: ${{fmt(r.vpd)}}
+Like ratio: ${{r.lr?.toFixed ? r.lr.toFixed(1) : r.lr}}%
+Age: ${{r.age}}
+
+I want to make a better version of this Short. Please give me:
+
+1. **5 TITLE OPTIONS** — different angles (click-bait, curiosity-gap, POV, controversy, bold statement)
+2. **3-SECOND HOOK SCRIPT** — exact words to say out loud at the start
+3. **SHOT BREAKDOWN** — 5 shots describing exactly what to film for each segment
+4. **THUMBNAIL TEXT** — 3-5 words in caps for the text overlay
+5. **5 HASHTAGS** — best ones for this niche
+6. **MY UNIQUE ANGLE** — one specific twist to make my version better than the original
+7. **WHY IT WENT VIRAL** — one sentence on what made this format explode
+
+Be specific and actionable. No fluff.`
+
+  navigator.clipboard.writeText(prompt)
+  // Show toast
+  const toast = document.createElement("div")
+  toast.style.cssText = "position:fixed;bottom:24px;right:24px;background:var(--accent);color:#000;padding:10px 18px;border-radius:8px;font-size:13px;font-weight:700;z-index:9999;animation:fadeIn .2s"
+  toast.textContent = "✓ Prompt copied — paste into Claude.ai, Gemini or ChatGPT (free)"
+  document.body.appendChild(toast)
+  setTimeout(() => toast.remove(), 3500)
+}}
+
+// ─── AI STUDIO ───────────────────────────────────────────────
+
+function renderBsStudio() {{
+  const cards = BRAINSTORM.cards || []
+  const gaps  = BRAINSTORM.gaps  || []
+  const topOptions = cards.slice(0,20).map((r,i) =>
+    `<option value="${{i}}">#${{i+1}} — ${{r.channel}}: ${{r.title.slice(0,50)}}${{r.title.length>50?"…":""}}</option>`
+  ).join("")
+
+  document.getElementById("bsStudioView").innerHTML = `
+    <div class="bs-studio-wrap">
+
+      <!-- MAIN GENERATOR CARD -->
+      <div class="bs-studio-card">
+        <div class="bs-studio-head">🤖 AI Idea Generator</div>
+        <div class="bs-studio-sub">Generate full production briefs from competitor videos, or create completely original banger ideas from scratch. Works with Claude API or copy the prompt for any free AI.</div>
+
+        <!-- MODE SWITCH -->
+        <div class="bs-mode-row">
+          <button class="bs-mode-btn active" id="modeRemakeBtn" onclick="setStudioMode('remake')">🎯 Remake Competitor</button>
+          <button class="bs-mode-btn" id="modeOriginalBtn" onclick="setStudioMode('original')">💡 Original Idea</button>
+        </div>
+
+        <!-- REMAKE MODE -->
+        <div id="studioRemakePanel">
+          <div class="bs-studio-label">SELECT A TOP VIDEO TO REMAKE</div>
+          <select class="bs-studio-select" id="studioPickVideo">
+            ${{topOptions || "<option>No videos — run a scan first</option>"}}
+          </select>
+          <div class="bs-studio-actions">
+            <button class="bs-studio-btn" onclick="runStudioRemake()">🎬 Generate Full Brief</button>
+            <button class="bs-prompt-btn" onclick="copyStudioPrompt('remake')">📋 Copy Prompt for Free AI</button>
+          </div>
+        </div>
+
+        <!-- ORIGINAL MODE -->
+        <div id="studioOriginalPanel" style="display:none">
+          <div class="bs-studio-label">TOPIC OR ANGLE</div>
+          <input class="bs-studio-input" id="studioTopic" placeholder="e.g. 'Brawl Stars meta tier list' or 'op brawler nobody uses'">
+          <div class="bs-studio-label">FORMAT</div>
+          <select class="bs-studio-select" id="studioFormat">
+            <option value="Ranking">📊 Ranking / Tier List</option>
+            <option value="Reveal">🔍 Reveal / Secret</option>
+            <option value="POV">👁 POV</option>
+            <option value="Tutorial">📚 Tutorial / How-To</option>
+            <option value="Comparison">⚖️ Comparison / VS</option>
+            <option value="Challenge">🏆 Challenge</option>
+            <option value="Reaction">😮 Reaction</option>
+            <option value="Story">📖 Story</option>
+            <option value="Expose">⚠️ Expose</option>
+            <option value="Question">❓ Question</option>
+          </select>
+          <div class="bs-studio-actions">
+            <button class="bs-studio-btn" onclick="runStudioOriginal()">⚡ Generate Banger Idea</button>
+            <button class="bs-prompt-btn" onclick="copyStudioPrompt('original')">📋 Copy Prompt for Free AI</button>
+          </div>
+        </div>
+
+        <!-- OUTPUT AREA -->
+        <div class="bs-studio-output" id="studioOutput"></div>
+      </div>
+
+      <!-- GAP QUICK-GENERATE CARD -->
+      ${{gaps.filter(g=>g.untapped).length ? `
+      <div class="bs-studio-card">
+        <div class="bs-studio-head">🕳 Untapped Formats — Generate Ideas Instantly</div>
+        <div class="bs-studio-sub">These are formats your competitors use that you haven't touched. Click to generate an original idea for each.</div>
+        ${{gaps.filter(g=>g.untapped).slice(0,5).map(g => `
+          <div style="display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)">
+            <span class="fmt-badge" style="font-size:12px;padding:3px 12px">${{g.format}}</span>
+            <span style="flex:1;font-size:12px;color:var(--muted2)">${{g.count}} competitor videos · avg <strong style="color:#fff">${{fmt(g.avg_views)}}</strong> views</span>
+            <button class="bs-btn-gen" id="gap-btn-${{g.format}}" onclick="generateFromGap('${{g.format}}',this)">⚡ Generate Idea</button>
+          </div>
+          <div class="bs-studio-output" id="gap-out-${{g.format}}" style="margin:8px 0 4px"></div>
+        `).join("")}}
+      </div>` : ""}}
+
+    </div>`
+}}
+
+function setStudioMode(mode) {{
+  bsStudioMode = mode
+  document.getElementById("modeRemakeBtn").classList.toggle("active", mode === "remake")
+  document.getElementById("modeOriginalBtn").classList.toggle("active", mode === "original")
+  document.getElementById("studioRemakePanel").style.display  = mode === "remake"   ? "block" : "none"
+  document.getElementById("studioOriginalPanel").style.display = mode === "original" ? "block" : "none"
+}}
+
+async function runStudioRemake() {{
+  const idx = parseInt(document.getElementById("studioPickVideo")?.value) || 0
+  const r   = (BRAINSTORM.cards || [])[idx]
+  if (!r) return
+  const out = document.getElementById("studioOutput")
+  out.style.display = "block"
+  out.innerHTML = `<div class="bs-studio-out-loading"><div class="bs-brief-spin"></div><span>Generating full brief for: "${{r.title.slice(0,50)}}"…</span></div>`
+  try {{
+    const text  = await callClaudeAPI(buildBriefPrompt(r), 900)
+    const brief = parseBriefJSON(text)
+    bsBriefCache[r.id] = brief
+    out.innerHTML = `<div class="bs-studio-out-head">
+      <span style="color:var(--accent)">✦ BRIEF READY — ${{r.channel}}: ${{r.title.slice(0,45)}}${{r.title.length>45?"…":""}}</span>
+      <button class="bs-copy-btn" onclick="copyEntireBrief('${{r.id}}')">Copy All</button>
+    </div>` + renderBriefHtml(r.id)
+  }} catch(e) {{
+    out.innerHTML = `<div style="color:var(--accent2);font-size:13px">⚠ API error — use the 📋 Copy Prompt button to generate with any free AI instead.</div>`
+  }}
+}}
+
+async function runStudioOriginal() {{
+  const topic  = document.getElementById("studioTopic")?.value.trim() || ""
+  const format = document.getElementById("studioFormat")?.value || "Ranking"
+  if (!topic) {{ alert("Enter a topic first!"); return }}
+  const out = document.getElementById("studioOutput")
+  out.style.display = "block"
+  out.innerHTML = `<div class="bs-studio-out-loading"><div class="bs-brief-spin"></div><span>Generating original "${{format}}" idea about "${{topic}}"…</span></div>`
+
+  const top3 = (BRAINSTORM.cards||[]).slice(0,3).map(r => `- "${{r.title}}" (${{fmt(r.views)}} views, ${{r.channel}})`).join("\\n")
+  const prompt = `You are an elite YouTube Shorts strategist.
+
+Top viral videos in this niche right now:
+${{top3 || "No examples available"}}
+
+I want to make an original SHORT in the "${{format}}" format about: "${{topic}}"
+
+Generate a completely fresh, never-done banger idea. Return ONLY valid JSON, no markdown:
+
+{{
+  "titles": ["title 1 (high CTR)", "title 2 (curiosity gap)", "title 3 (bold claim)", "title 4 (POV/personal)", "title 5 (controversy)"],
+  "hook": "Exact words to say out loud in seconds 0-3",
+  "shots": ["Shot 1 (0-3s): ...", "Shot 2 (3-8s): ...", "Shot 3 (8-16s): ...", "Shot 4 (16-24s): ...", "Shot 5 (24-30s): ..."],
+  "thumbnail": "3-5 WORDS IN CAPS",
+  "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"],
+  "angle": "What makes this original and why it will work",
+  "why_viral": "One sentence on why this format kills in this niche"
+}}`
+
+  const tempId = "studio-" + Date.now()
+  try {{
+    const text  = await callClaudeAPI(prompt, 900)
+    const brief = parseBriefJSON(text)
+    bsBriefCache[tempId] = brief
+    out.innerHTML = `<div class="bs-studio-out-head">
+      <span style="color:var(--accent)">✦ ORIGINAL IDEA — ${{format}} · ${{topic}}</span>
+      <button class="bs-copy-btn" onclick="copyEntireBrief('${{tempId}}')">Copy All</button>
+    </div>` + renderBriefHtml(tempId)
+  }} catch(e) {{
+    out.innerHTML = `<div style="color:var(--accent2);font-size:13px">⚠ API error — use the 📋 Copy Prompt button instead.</div>`
+  }}
+}}
+
+async function generateFromGap(format, btn) {{
+  const out = document.getElementById("gap-out-" + format)
+  if (!out) return
+  btn.disabled = true
+  btn.textContent = "⏳ Generating…"
+  out.style.display = "block"
+  out.innerHTML = `<div class="bs-studio-out-loading"><div class="bs-brief-spin"></div><span>Generating ${{format}} idea from your gap data…</span></div>`
+
+  const top3 = (BRAINSTORM.cards||[]).filter(r=>r.format===format).slice(0,3)
+    .map(r=>`- "${{r.title}}" (${{fmt(r.views)}} views)`).join("\\n") || 
+    (BRAINSTORM.cards||[]).slice(0,3).map(r=>`- "${{r.title}}" (${{fmt(r.views)}} views)`).join("\\n")
+
+  const prompt = `You are an elite YouTube Shorts strategist.
+Top competitor "${{format}}" videos I'm seeing:
+${{top3}}
+
+Generate a completely original SHORT idea using the "${{format}}" format. Return ONLY valid JSON:
+
+{{
+  "titles": ["title 1", "title 2", "title 3", "title 4", "title 5"],
+  "hook": "Exact opening script for seconds 0-3",
+  "shots": ["Shot 1 (0-3s): ...", "Shot 2 (3-8s): ...", "Shot 3 (8-16s): ...", "Shot 4 (16-24s): ...", "Shot 5 (24-30s): ..."],
+  "thumbnail": "3-5 WORDS IN CAPS",
+  "hashtags": ["#tag1","#tag2","#tag3","#tag4","#tag5"],
+  "angle": "What makes this unique",
+  "why_viral": "Why this format works right now"
+}}`
+
+  const tempId = "gap-" + format + "-" + Date.now()
+  try {{
+    const text  = await callClaudeAPI(prompt, 800)
+    const brief = parseBriefJSON(text)
+    bsBriefCache[tempId] = brief
+    out.innerHTML = `<div class="bs-studio-out-head">
+      <span style="color:var(--accent)">✦ ${{format.toUpperCase()}} IDEA GENERATED</span>
+      <button class="bs-copy-btn" onclick="copyEntireBrief('${{tempId}}')">Copy All</button>
+    </div>` + renderBriefHtml(tempId)
+    btn.textContent = "🔄 Regenerate"
+    btn.disabled = false
+  }} catch(e) {{
+    out.innerHTML = `<div style="color:var(--accent2);font-size:13px">⚠ API error — try the 📋 Copy Prompt button.</div>`
+    btn.textContent = "⚡ Generate Idea"
+    btn.disabled = false
+  }}
+}}
+
+function copyStudioPrompt(mode) {{
+  let prompt = ""
+  if (mode === "remake") {{
+    const idx = parseInt(document.getElementById("studioPickVideo")?.value) || 0
+    const r   = (BRAINSTORM.cards || [])[idx]
+    if (!r) return
+    prompt = `You are an elite YouTube Shorts strategist. A competitor video just went massively viral:
+
+Title: "${{r.title}}"
+Channel: ${{r.channel}}
+Format: ${{r.format}}
+Views: ${{fmt(r.views)}} (${{r.score?.toFixed(1)}}× channel average)
+Views/day: ${{fmt(r.vpd)}} / Like ratio: ${{r.lr?.toFixed(1)}}%
+
+Give me a COMPLETE production brief with: 5 title options, exact 3-second hook script, shot-by-shot breakdown (5 shots), thumbnail text, 5 hashtags, my unique angle, and why it went viral. Be specific.`
+  }} else {{
+    const topic  = document.getElementById("studioTopic")?.value.trim() || "your topic"
+    const format = document.getElementById("studioFormat")?.value || "Ranking"
+    prompt = `You are an elite YouTube Shorts strategist. I make content in a gaming/entertainment niche.
+
+I want to create an original "${{format}}" format Short about: "${{topic}}"
+
+Give me: 5 title options (different angles), exact 3-second hook script, shot-by-shot breakdown (5 shots), thumbnail text, 5 hashtags, what makes this unique, and why it will go viral. Be specific and actionable.`
+  }}
+  navigator.clipboard.writeText(prompt)
+  const toast = document.createElement("div")
+  toast.style.cssText = "position:fixed;bottom:24px;right:24px;background:var(--accent3);color:#000;padding:10px 18px;border-radius:8px;font-size:13px;font-weight:700;z-index:9999"
+  toast.textContent = "✓ Prompt copied — paste into Claude.ai, Gemini, or ChatGPT (all free)"
+  document.body.appendChild(toast)
+  setTimeout(() => toast.remove(), 3500)
+}}
+
+// ─── GAP FINDER ──────────────────────────────────────────────
+
+function renderBsGaps() {{
+  const gaps = BRAINSTORM.gaps || []
+  if (!gaps.length) {{
+    document.getElementById("bsGapsView").innerHTML = `<div class="empty"><div class="empty-icon">🕳</div><p>Not enough data yet</p></div>`
+    return
+  }}
+  let h = `<div style="margin-bottom:14px;font-size:13px;color:var(--muted)">Formats ranked by competitor avg views · <span style="color:var(--accent)">🟢 = formats you haven't posted yet</span></div>`
+  gaps.forEach(g => {{
+    const tag = g.untapped
+      ? `<span style="color:var(--accent);font-size:11px;font-weight:700;background:rgba(0,232,181,.1);padding:2px 8px;border-radius:10px;border:1px solid rgba(0,232,181,.3)">🟢 UNTAPPED</span>`
+      : `<span style="color:var(--muted);font-size:11px">already posting</span>`
+    h += `<div class="gap-card ${{g.untapped?"gap-untapped":"gap-covered"}}">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap">
+        <span class="fmt-badge" style="font-size:12px;padding:3px 12px">${{g.format}}</span>
+        ${{tag}}
+        <span style="font-family:var(--mono);font-size:12px;color:var(--muted2);margin-left:auto">${{g.count}} videos · avg <strong style="color:#fff">${{fmt(g.avg_views)}}</strong> views</span>
+        ${{g.untapped ? `<button class="bs-btn-gen" id="gap-btn-${{g.format}}" onclick="generateFromGap('${{g.format}}',this)">⚡ Generate Idea</button>` : ""}}
+      </div>
+      ${{(g.examples||[]).map(e=>`<div style="display:flex;align-items:center;gap:9px;padding:7px 0;border-top:1px solid var(--border)">
+        ${{CH_PFP[e.channel]?`<img class="ch-pfp" src="${{CH_PFP[e.channel]}}" alt="" style="width:20px;height:20px;flex-shrink:0" onerror="this.style.display='none'">`:""}}
+        <span style="font-size:12px;color:var(--muted);min-width:90px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0">${{e.channel}}</span>
+        <span style="font-size:13px;color:var(--text);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${{e.title}}</span>
+        <span style="font-family:var(--mono);font-size:11px;color:#fff;flex-shrink:0">${{fmt(e.views)}}</span>
+      </div>`).join("")}}
+      <div class="bs-studio-output" id="gap-out-${{g.format}}" style="margin:10px 0 0"></div>
+    </div>`
+  }})
+  document.getElementById("bsGapsView").innerHTML = h
+}}
+
+
 
 // ══════════════════════════════════════════════════════════════
 // ★ TREND RADAR rendering
@@ -1165,7 +2085,7 @@ function renderTrends() {{
     const chPills = t.channels.slice(0,6).map(c=>`<div class="tr-ch-pill">${{c}}</div>`).join("")
     const entries = t.entries.slice(0,3).map(e => `
       <div class="tr-entry">
-        <div class="tr-entry-ch">${{e.channel}}</div>
+        <div class="tr-entry-ch">${{CH_PFP[e.channel]?`<img class="ch-pfp" src="${{CH_PFP[e.channel]}}" alt="" style="width:16px;height:16px;flex-shrink:0" onerror="this.style.display='none'">`:""}}<span>${{e.channel}}</span></div>
         <div class="tr-entry-t">${{e.title}}</div>
         <div class="tr-entry-v">${{fmt(e.views)}}</div>
         <a href="https://youtube.com/shorts/${{e.id}}" target="_blank" style="color:var(--accent);font-size:11px;margin-left:6px">▶</a>
@@ -1214,9 +2134,11 @@ function renderFreq() {{
   let alerts = ""
   if (surges.length) {{
     const cards = surges.slice(0,5).map(r => `
-      <div style="display:flex;align-items:center;gap:14px;padding:9px 0;border-bottom:1px solid var(--border)">
-        <div style="flex:1">
-          <div style="font-size:13px;font-weight:600;color:#fff">${{r.channel}}</div>
+      <div style="display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--border)">
+        ${{CH_PFP[r.channel]?`<img class="ch-pfp" src="${{CH_PFP[r.channel]}}" alt="" style="width:28px;height:28px;flex-shrink:0" onerror="this.style.display='none'">`:
+          `<div class="ch-pfp-placeholder" style="width:28px;height:28px;font-size:12px;flex-shrink:0">${{(r.channel||"?")[0].toUpperCase()}}</div>`}}
+        <div style="flex:1;min-width:0">
+          <div style="font-size:13px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${{r.channel}}</div>
           <div style="font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:2px">
             ${{r.recent_avg.toFixed(1)}}/wk now vs ${{r.older_avg.toFixed(1)}}/wk before
             · <span style="color:var(--accent)">+${{Math.round((r.trend_ratio-1)*100)}}%</span>
@@ -1231,9 +2153,11 @@ function renderFreq() {{
   }}
   if (quiets.length) {{
     const cards = quiets.slice(0,5).map(r => `
-      <div style="display:flex;align-items:center;gap:14px;padding:9px 0;border-bottom:1px solid var(--border)">
-        <div style="flex:1">
-          <div style="font-size:13px;font-weight:600;color:#fff">${{r.channel}}</div>
+      <div style="display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--border)">
+        ${{CH_PFP[r.channel]?`<img class="ch-pfp" src="${{CH_PFP[r.channel]}}" alt="" style="width:28px;height:28px;flex-shrink:0" onerror="this.style.display='none'">`:
+          `<div class="ch-pfp-placeholder" style="width:28px;height:28px;font-size:12px;flex-shrink:0">${{(r.channel||"?")[0].toUpperCase()}}</div>`}}
+        <div style="flex:1;min-width:0">
+          <div style="font-size:13px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${{r.channel}}</div>
           <div style="font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:2px">
             ${{r.status==="ghost"?`${{r.weeks_since}} weeks silent`:`Dropped ${{Math.round((1-r.trend_ratio)*100)}}% from ${{r.older_avg.toFixed(1)}}/wk`}}
           </div>
@@ -1257,7 +2181,7 @@ function renderFreq() {{
       ? `<span style="color:var(--accent2)">${{r.weeks_since}}w silent</span>`
       : `<span style="color:var(--accent)">active</span>`
     return `<tr>
-      <td style="font-weight:500;color:#fff;text-align:left">${{r.channel}}</td>
+      <td style="font-weight:500;color:#fff;text-align:left"><div class="ch-pfp-cell">${{CH_PFP[r.channel]?`<img class="ch-pfp" src="${{CH_PFP[r.channel]}}" alt="" style="width:22px;height:22px;flex-shrink:0" onerror="this.style.display='none'">`:""}}<span>${{r.channel}}</span></div></td>
       <td><span class="freq-status ${{STATUS_CSS[r.status]||"fs-low"}}">${{STATUS_LABEL[r.status]||r.status}}</span></td>
       <td style="font-family:var(--mono)">${{r.recent_avg.toFixed(1)}}</td>
       <td style="font-family:var(--mono);color:var(--muted)">${{r.older_avg.toFixed(1)}}</td>
@@ -1344,8 +2268,9 @@ function renderBenchmark() {{
     viewsMet.breakdown.forEach(ch => {{
       const pct  = Math.round(ch.value/maxV*100)
       const color = ch.is_mine ? "linear-gradient(90deg,var(--accent3),#ffd700)" : "linear-gradient(90deg,var(--accent),var(--blue))"
-      sc += `<div class="bm-bar-wrap">
-        <div class="bm-bar-label" style="${{ch.is_mine?"color:var(--accent3);font-weight:700":""}}">${{ch.is_mine?"★ "+ch.channel:ch.channel}}</div>
+        const pfpHtml = CH_PFP[ch.channel]?`<img class="ch-pfp" src="${{CH_PFP[ch.channel]}}" alt="" style="width:18px;height:18px;flex-shrink:0" onerror="this.style.display='none'">`:""
+        sc += `<div class="bm-bar-wrap">
+        <div class="bm-bar-label" style="${{ch.is_mine?"color:var(--accent3);font-weight:700":""}}">${{pfpHtml}}<span>${{ch.is_mine?"★ "+ch.channel:ch.channel}}</span></div>
         <div class="bm-bar-track"><div class="bm-bar-fill" style="width:${{pct}}%;background:${{color}}"></div></div>
         <div class="bm-bar-val">${{fmtVal("avg_views",ch.value)}}</div>
       </div>`
@@ -1361,8 +2286,9 @@ function renderBenchmark() {{
       scoreMet.breakdown.forEach(ch => {{
         const pct  = Math.round(ch.value/maxS*100)
         const color = ch.is_mine ? "linear-gradient(90deg,var(--accent3),#ffd700)" : "linear-gradient(90deg,#ff6600,#ff2244)"
+        const pfpHtml2 = CH_PFP[ch.channel]?`<img class="ch-pfp" src="${{CH_PFP[ch.channel]}}" alt="" style="width:18px;height:18px;flex-shrink:0" onerror="this.style.display='none'">`:""
         sc += `<div class="bm-bar-wrap">
-          <div class="bm-bar-label" style="${{ch.is_mine?"color:var(--accent3);font-weight:700":""}}">${{ch.is_mine?"★ "+ch.channel:ch.channel}}</div>
+          <div class="bm-bar-label" style="${{ch.is_mine?"color:var(--accent3);font-weight:700":""}}">${{pfpHtml2}}<span>${{ch.is_mine?"★ "+ch.channel:ch.channel}}</span></div>
           <div class="bm-bar-track"><div class="bm-bar-fill" style="width:${{pct}}%;background:${{color}}"></div></div>
           <div class="bm-bar-val">${{fmtVal("avg_score",ch.value)}}</div>
         </div>`
@@ -1452,20 +2378,55 @@ function renderThumbnails() {{
 }}
 
 // ── CHANNELS ──
+let chSortKey = "views", chSortDir = -1  // -1 = desc, 1 = asc
+
+const CH_COLS = [
+  {{ key:"views",     label:"Total Views",  fmt: c => `<span style="color:#fff">${{fmt(c.views)}}</span>` }},
+  {{ key:"subs",      label:"Subs",         fmt: c => c.subs ? fmt(c.subs) : "—" }},
+  {{ key:"count",     label:"Shorts",       fmt: c => c.count }},
+  {{ key:"growth",    label:"Growth",       fmt: c => c.growth>0 ? `<span style="color:var(--accent)">+${{fmt(c.growth)}}</span>` : `<span style="color:var(--muted)">${{fmt(c.growth)}}</span>` }},
+  {{ key:"avg",       label:"Avg Views",    fmt: c => fmt(c.avg) }},
+  {{ key:"avg_score", label:"Avg Score",    fmt: c => `<span style="color:${{c.avg_score>=3?"var(--accent2)":c.avg_score>=1.5?"var(--accent3)":"inherit"}}">${{c.avg_score.toFixed(2)}}×</span>` }},
+  {{ key:"best_score",label:"Best Score",   fmt: c => `<span style="color:var(--accent)">${{c.best_score.toFixed(2)}}×</span>` }},
+  {{ key:"avg_lr",    label:"Like%",        fmt: c => `<span style="color:var(--blue)">${{c.avg_lr.toFixed(1)}}%</span>` }},
+]
+
 function renderChannels() {{
-  const maxV = CHANNELS[0]?.views||1
-  let tbl = `<table class="ch-table"><thead><tr><th>Channel</th><th>Subs</th><th>Shorts</th><th>Total Views</th><th>Growth</th><th>Avg Views</th><th>Avg Score</th><th>Best Score</th><th>Like%</th></tr></thead><tbody>`
-  CHANNELS.forEach(c => {{
-    const g = c.growth>0?`<span style="color:var(--accent)">+${{fmt(c.growth)}}</span>`:`<span style="color:var(--muted)">${{fmt(c.growth)}}</span>`
-    tbl += `<tr class="${{c.is_mine?"mine-row":""}}">
-      <td>${{c.channel}}${{c.is_mine?" ★":""}}</td><td>${{c.subs?fmt(c.subs):"—"}}</td><td>${{c.count}}</td>
-      <td style="color:#fff">${{fmt(c.views)}}</td><td>${{g}}</td><td>${{fmt(c.avg)}}</td>
-      <td style="color:${{c.avg_score>=3?"var(--accent2)":c.avg_score>=1.5?"var(--accent3)":"inherit"}}">${{c.avg_score.toFixed(2)}}×</td>
-      <td style="color:var(--accent)">${{c.best_score.toFixed(2)}}×</td>
-      <td style="color:var(--blue)">${{c.avg_lr.toFixed(1)}}%</td>
-    </tr>`
+  const sorted = [...CHANNELS].sort((a,b) => {{
+    const av = a[chSortKey]??0, bv = b[chSortKey]??0
+    return chSortDir * (av < bv ? -1 : av > bv ? 1 : 0)
   }})
-  document.getElementById("chTable").innerHTML = tbl + `</tbody></table>`
+
+  let thead = `<tr><th style="text-align:left">Channel</th>`
+  CH_COLS.forEach(col => {{
+    let cls = ""
+    if (col.key === chSortKey) cls = chSortDir===-1 ? "sort-desc" : "sort-asc"
+    thead += `<th class="${{cls}}" data-col="${{col.key}}">${{col.label}}</th>`
+  }})
+  thead += `</tr>`
+
+  let tbody = ""
+  sorted.forEach(c => {{
+    const pfpUrl = CH_PFP[c.channel]
+    const pfpHtml = pfpUrl
+      ? `<img class="ch-pfp" src="${{pfpUrl}}" alt="" loading="lazy" onerror="this.style.display='none';this.nextSibling.style.display='flex'"><div class="ch-pfp-placeholder" style="display:none">${{(c.channel||"?")[0].toUpperCase()}}</div>`
+      : `<div class="ch-pfp-placeholder">${{(c.channel||"?")[0].toUpperCase()}}</div>`
+    tbody += `<tr class="${{c.is_mine?"mine-row":""}}">
+      <td><div class="ch-pfp-cell">${{pfpHtml}}<span>${{c.channel}}${{c.is_mine?" ★":""}}</span></div></td>`
+    CH_COLS.forEach(col => {{ tbody += `<td>${{col.fmt(c)}}</td>` }})
+    tbody += `</tr>`
+  }})
+
+  document.getElementById("chTable").innerHTML =
+    `<table class="ch-table"><thead>${{thead}}</thead><tbody>${{tbody}}</tbody></table>`
+
+  document.querySelectorAll(".ch-table th[data-col]").forEach(th => {{
+    th.addEventListener("click", () => {{
+      if (chSortKey === th.dataset.col) {{ chSortDir *= -1 }}
+      else {{ chSortKey = th.dataset.col; chSortDir = -1 }}
+      renderChannels()
+    }})
+  }})
 }}
 
 // ── TIMING ──
@@ -1497,7 +2458,7 @@ function renderHOF() {{
   document.getElementById("hofContent").innerHTML = HOF.map(v => `
     <div class="hof-card">
       <div class="hof-score">${{v.score_at_entry.toFixed(1)}}×</div>
-      <div><div class="hof-ch">${{v.channel}}</div><div class="hof-t">${{v.title}}</div></div>
+      <div><div class="hof-ch">${{CH_PFP[v.channel]?`<img class="ch-pfp" src="${{CH_PFP[v.channel]}}" alt="" style="width:18px;height:18px" onerror="this.style.display='none'">`:""}}<span>${{v.channel}}</span></div><div class="hof-t">${{v.title}}</div></div>
       <div class="hof-right">
         <div class="hof-views">${{fmt(v.views)}}</div>
         <div class="hof-age">${{v.entered_at?.slice(0,10)||""}}</div>
@@ -1569,7 +2530,7 @@ function renderVelocity() {{
       <div class="vel-header">
         <div style="font-family:var(--mono);font-size:18px;font-weight:700;color:var(--border2)">#${{i+1}}</div>
         <div>
-          <div class="vel-ch">${{v.channel}}${{meTag}}</div>
+          <div class="vel-ch">${{CH_PFP[v.channel]?`<img class="ch-pfp" src="${{CH_PFP[v.channel]}}" alt="" style="width:18px;height:18px" onerror="this.style.display='none'">`:""}}<span>${{v.channel}}</span>${{meTag}}</div>
           <div class="vel-title">${{v.title}}</div>
         </div>
         <div style="margin-left:auto"><span class="vel-badge ${{st.cls}}">${{st.label}}</span></div>
@@ -1736,4 +2697,3 @@ renderVideos()
 # ══════════════════════════════════════════════════════════════
 #  BRAINSTORM
 # ══════════════════════════════════════════════════════════════
-

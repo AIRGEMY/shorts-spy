@@ -9,7 +9,7 @@
 # Set via environment variable: export YOUTUBE_API_KEY="your_key_here"
 # Or paste directly below (never commit a real key to git!)
 import os as _os
-API_KEY = _os.environ.get("YOUTUBE_API_KEY", "")
+API_KEY = _os.environ.get("YOUTUBE_API_KEY", "AIzaSyD2G3VWv3AyU1sa1fpOcoAsm0AtJg-cd98")
 
 # ── Your own channel ID (used for benchmarking) ───────────────
 YOUR_CHANNEL = "UUjHaiSX0jk8RYKmCvy5LKQg"
@@ -51,6 +51,14 @@ DEFAULT_CHANNELS = [
     "UUXRFfkHvcgbOQF_lmSUSGyQ",
     "UUgoi2le6lhgM32c3AO_mfiA",
     "UUQrFGvPdGeqADOJSLkKgqPA",
+    "UUrGeWLdH4VZn36TMUS9VDIQ",
+    "UUcGpZ8YIm2DlMD00bUXBbJw",
+    "UUoUXSrVjIaclxkEdkQgzV4A",
+    "UUGHUurB-2aMkGvzFwtOuqAw",
+    "UUdX5PargxH_dGcoOs90Z8Ew",
+    "UU_ATiITa-Q7Xlpx8cu-mbNA",
+    "UUXZEsJtGMXXt4NR6Jj9LwkA",
+    "UUPbX9kcq4GK9hwDgMmvwQOg",
     "UUjHaiSX0jk8RYKmCvy5LKQg",  # ← your own channel (included in scans)
 ]
 

@@ -42,14 +42,22 @@ def get_playlist_id(youtube, channel_id, cache):
     except: return None
 
 def fetch_subscriber_counts(channel_ids, cache):
+    if not API_KEY: return
     missing = [cid for cid in channel_ids if cid and cid not in cache.get("subs", {})]
-    if not missing: return
+    missing_pfp = [cid for cid in channel_ids if cid and cid not in cache.get("pfps", {})]
+    all_missing = list(set(missing + missing_pfp))
+    if not all_missing: return
     youtube = build("youtube", "v3", developerKey=API_KEY)
-    for i in range(0, len(missing), 50):
+    for i in range(0, len(all_missing), 50):
         try:
-            res = youtube.channels().list(part="statistics", id=",".join(missing[i:i+50])).execute()
+            res = youtube.channels().list(part="statistics,snippet", id=",".join(all_missing[i:i+50])).execute()
             for item in res.get("items", []):
-                cache.setdefault("subs", {})[item["id"]] = int(item["statistics"].get("subscriberCount", 0))
+                cid = item["id"]
+                cache.setdefault("subs", {})[cid] = int(item["statistics"].get("subscriberCount", 0))
+                thumbs = item.get("snippet", {}).get("thumbnails", {})
+                pfp_url = (thumbs.get("medium") or thumbs.get("default") or {}).get("url", "")
+                if pfp_url:
+                    cache.setdefault("pfps", {})[cid] = pfp_url
         except: pass
 
 # ══════════════════════════════════════════════════════════════
