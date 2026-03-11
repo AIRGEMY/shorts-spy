@@ -26,6 +26,7 @@ from config import (
 )
 import state
 from freq import _update_freq_tracker
+from data import build_rows
 
 def get_playlist_id(youtube, channel_id, cache):
     if channel_id.startswith("UU"): return channel_id
